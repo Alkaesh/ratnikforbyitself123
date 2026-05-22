@@ -607,13 +607,14 @@ pcall(function()
 end)
 
 -- Создаём табы заранее, чтобы можно было ссылаться из любого места
-local SailorTab   = Window:CreateTab("Sailor Piece", 4483362458)
-local CombatTab   = Window:CreateTab("Бой",          4483345998)
-local PlayerTab   = Window:CreateTab("Персонаж",     7733715400)
-local VisualsTab  = Window:CreateTab("Графика",      4483345998)
-local ESPTab      = Window:CreateTab("ESP",          7734053495)
-local WorldTab    = Window:CreateTab("Мир",          4483345998)
-local SettingsTab = Window:CreateTab("Настройки",    4483345998)
+local SailorTab    = Window:CreateTab("Sailor Piece", 4483362458)
+local CombatTab    = Window:CreateTab("Бой",          4483345998)
+local PlayerTab    = Window:CreateTab("Персонаж",     7733715400)
+local VisualsTab   = Window:CreateTab("Графика",      4483345998)
+local ESPTab       = Window:CreateTab("ESP",          7734053495)
+local WorldTab     = Window:CreateTab("Мир",          4483345998)
+local ExpTab       = Window:CreateTab("⚠ Эксперимент", 4483345998)
+local SettingsTab  = Window:CreateTab("Настройки",    4483345998)
 
 
 --========================================================
@@ -3028,6 +3029,282 @@ SettingsTab:CreateParagraph({
 })
 
 --========================================================
+-- ⚠ EXPERIMENTAL TAB
+--========================================================
+-- Всё что тут — нерабочее в большинстве серверно-авторизованных игр.
+-- Sailor Piece — серверная. Эти штуки оставлены для:
+--   1) частных модов / тренировочных серверов
+--   2) случаев когда разраб ленится и доверяет клиенту что-то конкретное
+--   3) burst-DPS трюков (auto-clicker style)
+-- Если ничего не работает — это нормально, не баг скрипта.
+
+ExpTab:CreateParagraph({
+    Title = "⚠ ВНИМАНИЕ",
+    Content = "Эта вкладка — экспериментальная. Большинство фишек тут ломались при первом же серверном античит-патче или вообще никогда не работали в Sailor Piece.\n\n" ..
+              "Они не дадут тебе настоящий one-shot. Реальный шот босса в серверной игре требует знания конкретных RemoteEvent'ов конкретного DamageHandler'а игры — этого нет в универсальном скрипте.\n\n" ..
+              "Используй на свой страх и риск: можно получить кик от античита."
+})
+
+local exp_clientHpZeroEnabled = false
+local exp_toolSpamEnabled     = false
+local exp_remoteSpamEnabled   = false
+local exp_lockOnEnabled       = false
+
+local _exp_hpConn, _exp_toolConn, _exp_lockConn
+
+-- ====================================================
+-- 1) Клиентское обнуление HP цели (sp_currentMob)
+-- ====================================================
+-- В серверных играх перепишется обратно через replication.
+-- В клиентских / NPC с локальной логикой — сработает.
+local function _exp_stopHpZero()
+    if _exp_hpConn then _exp_hpConn:Disconnect(); _exp_hpConn = nil end
+end
+local function _exp_startHpZero()
+    _exp_stopHpZero()
+    _exp_hpConn = RunService.Heartbeat:Connect(function()
+        if not exp_clientHpZeroEnabled then _exp_stopHpZero(); return end
+        local mob = sp_currentMob
+        if not mob or not mob.Parent then return end
+        local hum = mob:FindFirstChildOfClass("Humanoid")
+        if hum and hum.Health > 0 then
+            -- В лоб: ставим 0. Если игра доверяет клиенту — моб умрёт.
+            pcall(function() hum.Health = 0 end)
+            -- Параллельно бомбим MaxHealth (некоторые серверы валидируют только Health,
+            -- а MaxHealth берут с клиента → если так, то Health > MaxHealth = ZeroDivide на сервере)
+            pcall(function() hum.MaxHealth = 0 end)
+        end
+    end)
+    track(_exp_hpConn)
+end
+
+ExpTab:CreateSection("⚡ One-Hit попытки")
+ExpTab:CreateParagraph({
+    Title = "Client HP = 0",
+    Content = "Каждый Heartbeat ставит Humanoid.Health = 0 на текущей цели (sp_currentMob — то что бьёт авто-фарм или босс-фарм). На серверной игре сразу же replicate'ится обратно. На клиентских / single-player-боссах может убить мгновенно."
+})
+ExpTab:CreateToggle({
+    Name = "Client HP-Zero на текущей цели",
+    CurrentValue = false,
+    Flag = "exp_clientHpZero",
+    Callback = function(v)
+        exp_clientHpZeroEnabled = v
+        if v then _exp_startHpZero() else _exp_stopHpZero() end
+    end
+})
+
+-- ====================================================
+-- 2) Tool:Activate burst spam (auto-clicker экстрим-режим)
+-- ====================================================
+-- Идея: если каждый твой удар наносит N урона по серверным правилам, то
+-- 50 ударов в секунду = 50N. Серверный rate-limit обычно ловит это, но в
+-- некоторых играх Activate-cooldown проверяется только клиентом. Тогда burst
+-- режет HP до нуля за секунду.
+local function _exp_stopToolSpam()
+    if _exp_toolConn then _exp_toolConn:Disconnect(); _exp_toolConn = nil end
+end
+local function _exp_startToolSpam()
+    _exp_stopToolSpam()
+    _exp_toolConn = RunService.Heartbeat:Connect(function()
+        if not exp_toolSpamEnabled then _exp_stopToolSpam(); return end
+        local char = safeGetCharacter()
+        if not char then return end
+        local tool = char:FindFirstChildOfClass("Tool")
+        if not tool then return end
+        if tool.Parent ~= char then return end
+        if not tool:FindFirstChild("Handle") then return end
+        -- Activate каждый кадр (60 в секунду). Это очень шумно — Sailor Piece
+        -- VFXHandlers.Katana может крашнуться на nil как мы уже видели.
+        pcall(function() tool:Activate() end)
+    end)
+    track(_exp_toolConn)
+end
+
+ExpTab:CreateParagraph({
+    Title = "Tool:Activate burst",
+    Content = "Спамит метод Activate() на экипированном Tool каждый кадр (~60/сек). Если серверный cooldown не серверный — burst-DPS x10. Может крашить клиентские VFX-скрипты, тогда сразу выключай."
+})
+ExpTab:CreateToggle({
+    Name = "Tool:Activate burst (60 раз/сек)",
+    CurrentValue = false,
+    Flag = "exp_toolSpam",
+    Callback = function(v)
+        exp_toolSpamEnabled = v
+        if v then _exp_startToolSpam() else _exp_stopToolSpam() end
+    end
+})
+
+-- ====================================================
+-- 3) Permanent Lock-On на одной цели (босс не сменяется когда теряется)
+-- ====================================================
+-- Боевые циклы переключаются на ближайшего моба когда текущий ушёл за радиус.
+-- Lock-on: один раз зафиксировал и держим, пока не умрёт. Полезно для боссов
+-- которые телепортируются и сбивают авто-таргет.
+local exp_lockTarget = nil
+
+local function _exp_stopLock()
+    if _exp_lockConn then _exp_lockConn:Disconnect(); _exp_lockConn = nil end
+    exp_lockTarget = nil
+end
+
+local function _exp_startLock()
+    _exp_stopLock()
+    -- Берём текущую цель боевого цикла как зафиксированную
+    exp_lockTarget = sp_currentMob
+    if not exp_lockTarget then
+        notify("[Exp] Сначала запусти бой, потом включай Lock-On")
+        return
+    end
+    notify("[Exp] Lock-On на: " .. exp_lockTarget.Name)
+    _exp_lockConn = RunService.Heartbeat:Connect(function()
+        if not exp_lockOnEnabled then _exp_stopLock(); return end
+        if not exp_lockTarget or not exp_lockTarget.Parent then
+            _exp_stopLock()
+            return
+        end
+        local hum = exp_lockTarget:FindFirstChildOfClass("Humanoid")
+        if not hum or hum.Health <= 0 then
+            _exp_stopLock()
+            return
+        end
+        -- Принудительно перезаписываем sp_currentMob каждый кадр —
+        -- даже если внутренний цикл переключился, мы возвращаем фокус.
+        sp_currentMob = exp_lockTarget
+    end)
+    track(_exp_lockConn)
+end
+
+ExpTab:CreateSection("🎯 Lock-On")
+ExpTab:CreateParagraph({
+    Title = "Permanent Lock-On",
+    Content = "Зафиксирует бой/God Mode/Anti-Damage на той цели, что бьётся СЕЙЧАС. Полезно для боссов с телепортами — иначе скрипт сбрасывается на ближайшего моба."
+})
+ExpTab:CreateToggle({
+    Name = "Lock-On на текущей цели",
+    CurrentValue = false,
+    Flag = "exp_lockOn",
+    Callback = function(v)
+        exp_lockOnEnabled = v
+        if v then _exp_startLock() else _exp_stopLock() end
+    end
+})
+
+-- ====================================================
+-- 4) Remote spam (БРУТФОРС, ОЧЕНЬ ШУМНО)
+-- ====================================================
+-- Ищем все RemoteEvent/RemoteFunction в ReplicatedStorage с подозрительными
+-- именами и пытаемся их вызвать с разными аргументами на цель.
+-- В 99% случаев сервер игнорирует или банит. Кнопка одноразовая — клик =
+-- одна попытка, чтобы не спамить навсегда.
+ExpTab:CreateSection("🔥 Brute-Force RemoteEvents")
+ExpTab:CreateParagraph({
+    Title = "ВНИМАНИЕ: высокий риск кика",
+    Content = "Эта кнопка пробегает ReplicatedStorage в поисках Remote'ов с именами 'Damage', 'Hit', 'DealDamage', 'Attack', 'Strike' и т.п., и вызывает их с (target, 999999) как аргументами. Серверный античит почти наверняка ловит это и кикает.\n\nКнопка делает ОДНУ попытку за клик."
+})
+ExpTab:CreateButton({
+    Name = "💥 Попытаться шотнуть текущую цель",
+    Callback = function()
+        local mob = sp_currentMob
+        if not mob then notify("[Exp] Нет цели — запусти бой сначала"); return end
+        local damageNames = {
+            "Damage", "DealDamage", "Hit", "Attack", "Strike",
+            "ApplyDamage", "DamageEvent", "HitEvent", "TakeDamage",
+            "DamageHandler", "EnemyDamage", "DamageNPC",
+        }
+        local function looksLikeDamage(name)
+            for _, d in ipairs(damageNames) do
+                if name == d then return true end
+            end
+            return false
+        end
+        local tried = 0
+        for _, container in ipairs({ ReplicatedStorage, workspace, game:GetService("ServerStorage") }) do
+            for _, d in ipairs(container:GetDescendants()) do
+                if (d:IsA("RemoteEvent") or d:IsA("RemoteFunction"))
+                   and looksLikeDamage(d.Name)
+                then
+                    tried = tried + 1
+                    pcall(function()
+                        if d:IsA("RemoteEvent") then
+                            d:FireServer(mob, 999999)
+                            d:FireServer(mob, mob.Name, 999999)
+                            d:FireServer(mob:FindFirstChildOfClass("Humanoid"), 999999)
+                        else
+                            d:InvokeServer(mob, 999999)
+                            d:InvokeServer(mob, mob.Name, 999999)
+                        end
+                    end)
+                end
+            end
+        end
+        notify(("[Exp] Попыток: %d — смотри упал ли HP"):format(tried))
+    end
+})
+
+ExpTab:CreateDivider()
+
+-- ====================================================
+-- 5) Void Kick — выбросить моба за карту
+-- ====================================================
+-- Самый "чистый" из экспериментальных трюков: серверу не нужно одобрять
+-- damage-event. Мы просто кидаем моба на Y = -1000 через CFrame.
+-- Сервер сам убивает Humanoid'ов которые упали в void (это часть стандартной
+-- Roblox-логики, проверка происходит на сервере через FallenPartsDestroyHeight).
+-- Не работает если: модель Anchored, или у разраба свой OOB-handler который
+-- возвращает мобов на спавн.
+ExpTab:CreateSection("⬇ Void Kick (бросить моба за карту)")
+ExpTab:CreateParagraph({
+    Title = "Как это работает",
+    Content = "Кнопка телепортирует HumanoidRootPart текущей цели на Y = -1000 (под мир). Стандартный Roblox-engine убивает Humanoid'ов которые ушли ниже workspace.FallenPartsDestroyHeight.\n\nРаботает на ванильных играх и простых модах. Не работает если у моба HRP.Anchored = true или если разраб написал свой 'возвращалка к спавну'."
+})
+ExpTab:CreateButton({
+    Name = "⬇ Бросить текущую цель в void",
+    Callback = function()
+        local mob = sp_currentMob
+        if not mob then notify("[Exp] Нет цели"); return end
+        local hrp = mob:FindFirstChild("HumanoidRootPart")
+            or mob:FindFirstChild("Torso") or mob.PrimaryPart
+        if not hrp then notify("[Exp] У цели нет HRP"); return end
+        local ok = pcall(function()
+            -- Снимаем Anchored чтобы CFrame применился, потом восстанавливаем.
+            -- Если у модели Network Owner = server (обычное дело для NPC), наш
+            -- CFrame применится только если игра не валидирует position cap.
+            local wasAnchored = hrp.Anchored
+            hrp.Anchored = false
+            for i = 1, 5 do
+                hrp.CFrame = CFrame.new(hrp.Position.X, -1000 - i * 50, hrp.Position.Z)
+                task.wait(0.05)
+            end
+            if wasAnchored then hrp.Anchored = true end
+        end)
+        notify(ok and "[Exp] Бросил в void — жду пока сервер убьёт"
+            or "[Exp] Не получилось переместить HRP")
+    end
+})
+
+-- ====================================================
+-- Экстренный стоп всего экспериментального
+-- ====================================================
+ExpTab:CreateDivider()
+ExpTab:CreateButton({
+    Name = "🛑 Выключить ВСЁ экспериментальное",
+    Callback = function()
+        exp_clientHpZeroEnabled = false
+        exp_toolSpamEnabled = false
+        exp_lockOnEnabled = false
+        _exp_stopHpZero()
+        _exp_stopToolSpam()
+        _exp_stopLock()
+        notify("[Exp] Все экспериментальные циклы выключены")
+    end
+})
+
+ExpTab:CreateParagraph({
+    Title = "Если ничего не работает",
+    Content = "В Sailor Piece урон пишется через зашифрованный CombatHandler с серверной валидацией траектории удара. Без реверса конкретно его RemoteEvent'ов one-shot не сделать. Использование Anti-Damage Anchor + честный auto-attack за 60 сек убивает большинство боссов без рисков бана."
+})
+
+--========================================================
 -- UNLOAD
 --========================================================
 _G.LunaUnload = function()
@@ -3042,6 +3319,11 @@ _G.LunaUnload = function()
     pcall(stopFly); pcall(stopInfJump); pcall(stopNoClip); pcall(stopAimbot)
     pcall(stopEspLoop); pcall(spStop); pcall(spBossStop)
     pcall(stopGodMode); pcall(stopGodMode2)
+    -- Experimental: гасим все циклы
+    exp_clientHpZeroEnabled = false
+    exp_toolSpamEnabled = false
+    exp_lockOnEnabled = false
+    pcall(_exp_stopHpZero); pcall(_exp_stopToolSpam); pcall(_exp_stopLock)
 
     -- Снимаем якорь персонажа на случай если Anti-Damage был включен
     pcall(function()
