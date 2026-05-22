@@ -206,7 +206,7 @@ do
     -- Контейнер чтобы Rotation работал на оба круга независимо
     local circleHolder = Instance.new("Frame")
     circleHolder.AnchorPoint = Vector2.new(0.5, 0.5)
-    circleHolder.Position = UDim2.fromScale(0.5, 0.52)
+    circleHolder.Position = UDim2.fromScale(0.5, 0.42)
     circleHolder.Size = UDim2.fromOffset(420, 420)
     circleHolder.BackgroundTransparency = 1
     circleHolder.Parent = bg
@@ -296,17 +296,61 @@ do
         ray.Parent = pentaHolder
     end
 
-    -- ---- Заголовок LUNA HUB (поверх круга) ----
+    -- ---- ПЕРСОНАЖ В ЦЕНТРЕ КРУГА (Sukuna / Gojo как символ "магической битвы") ----
+    -- Под персонажем — багровое свечение (имитация "проклятой энергии").
+    local cursedGlow = Instance.new("Frame")
+    cursedGlow.AnchorPoint = Vector2.new(0.5, 0.5)
+    cursedGlow.Position = UDim2.fromScale(0.5, 0.5)
+    cursedGlow.Size = UDim2.fromOffset(300, 300)
+    cursedGlow.BackgroundColor3 = Color3.fromRGB(180, 30, 50)
+    cursedGlow.BackgroundTransparency = 0.65
+    cursedGlow.BorderSizePixel = 0
+    cursedGlow.ZIndex = 3
+    cursedGlow.Parent = bg
+    local cgc = Instance.new("UICorner"); cgc.CornerRadius = UDim.new(1, 0); cgc.Parent = cursedGlow
+
+    -- Если Roblox Asset Moderation удалит ID — fallback показывает текстовый кандзи "呪".
+    -- Лежат под кругом, чтобы кольца "обнимали" персонажа.
+    local charImg = Instance.new("ImageLabel")
+    charImg.Name = "MagicChar"
+    charImg.AnchorPoint = Vector2.new(0.5, 0.5)
+    charImg.Position = UDim2.fromScale(0.5, 0.5)
+    charImg.Size = UDim2.fromOffset(280, 280)
+    charImg.BackgroundTransparency = 1
+    charImg.ScaleType = Enum.ScaleType.Fit
+    charImg.Image = "rbxassetid://13312562937"   -- Sukuna decal (если упадёт — заменим)
+    charImg.ImageTransparency = 0.05
+    charImg.ZIndex = 5   -- поверх кругов
+    charImg.Parent = bg
+
+    -- Резервный кандзи "呪" (jujutsu = проклятие) — фолбек если картинка не загрузится
+    local kanji = Instance.new("TextLabel")
+    kanji.AnchorPoint = Vector2.new(0.5, 0.5)
+    kanji.Position = UDim2.fromScale(0.5, 0.5)
+    kanji.Size = UDim2.fromOffset(280, 280)
+    kanji.BackgroundTransparency = 1
+    kanji.Text = "呪"
+    kanji.Font = Enum.Font.FredokaOne
+    kanji.TextSize = 220
+    kanji.TextColor3 = Color3.fromRGB(220, 80, 80)
+    kanji.TextTransparency = 0.5
+    kanji.TextStrokeTransparency = 0.3
+    kanji.TextStrokeColor3 = Color3.fromRGB(60, 0, 0)
+    kanji.ZIndex = 4   -- ниже картинки, выше кругов
+    kanji.Parent = bg
+
+    -- ---- Заголовок LUNA HUB (внизу под кругом, чтобы не закрывал персонажа) ----
     local title = Instance.new("TextLabel")
     title.AnchorPoint = Vector2.new(0.5, 0.5)
-    title.Position = UDim2.fromScale(0.5, 0.52)
-    title.Size = UDim2.new(0, 720, 0, 110)
+    title.Position = UDim2.fromScale(0.5, 0.85)
+    title.Size = UDim2.new(0, 720, 0, 90)
     title.BackgroundTransparency = 1
     title.Text = "LUNA HUB"
     title.Font = Enum.Font.GothamBlack
-    title.TextSize = 86
+    title.TextSize = 64
     title.TextColor3 = Color3.fromRGB(245, 235, 255)
-    title.TextStrokeTransparency = 1   -- свой stroke ниже
+    title.TextStrokeTransparency = 1
+    title.ZIndex = 10
     title.Parent = bg
 
     -- Двойной stroke: внешний толстый фиолетовый + тонкий белый поверх
@@ -330,7 +374,7 @@ do
     -- Подзаголовок
     local subtitle = Instance.new("TextLabel")
     subtitle.AnchorPoint = Vector2.new(0.5, 0.5)
-    subtitle.Position = UDim2.fromScale(0.5, 0.6)
+    subtitle.Position = UDim2.fromScale(0.5, 0.91)
     subtitle.Size = UDim2.new(0, 600, 0, 22)
     subtitle.BackgroundTransparency = 1
     subtitle.Text = "✦  S A I L O R   P I E C E  ✦"
@@ -338,15 +382,17 @@ do
     subtitle.TextSize = 14
     subtitle.TextColor3 = Color3.fromRGB(200, 180, 240)
     subtitle.TextTransparency = 0.1
+    subtitle.ZIndex = 10
     subtitle.Parent = bg
 
     -- ---- Прогресс-бар ----
     local barBg = Instance.new("Frame")
     barBg.AnchorPoint = Vector2.new(0.5, 0.5)
-    barBg.Position = UDim2.fromScale(0.5, 0.78)
+    barBg.Position = UDim2.fromScale(0.5, 0.74)
     barBg.Size = UDim2.new(0, 380, 0, 6)
     barBg.BackgroundColor3 = Color3.fromRGB(30, 20, 50)
     barBg.BorderSizePixel = 0
+    barBg.ZIndex = 10
     barBg.Parent = bg
     local bbc = Instance.new("UICorner"); bbc.CornerRadius = UDim.new(1, 0); bbc.Parent = barBg
 
@@ -356,6 +402,7 @@ do
     bar.Size = UDim2.new(0, 0, 1, 0)
     bar.BackgroundColor3 = Color3.fromRGB(180, 120, 255)
     bar.BorderSizePixel = 0
+    bar.ZIndex = 11
     bar.Parent = barBg
     local bc = Instance.new("UICorner"); bc.CornerRadius = UDim.new(1, 0); bc.Parent = bar
 
@@ -369,13 +416,14 @@ do
     -- статус
     local status = Instance.new("TextLabel")
     status.AnchorPoint = Vector2.new(0.5, 0.5)
-    status.Position = UDim2.fromScale(0.5, 0.83)
+    status.Position = UDim2.fromScale(0.5, 0.78)
     status.Size = UDim2.new(0, 600, 0, 18)
     status.BackgroundTransparency = 1
     status.Text = "плетение заклинания…"
     status.Font = Enum.Font.Gotham
     status.TextSize = 13
     status.TextColor3 = Color3.fromRGB(160, 145, 200)
+    status.ZIndex = 10
     status.Parent = bg
 
     -- ---- Анимации ----
@@ -401,10 +449,22 @@ do
         { Size = UDim2.fromOffset(680, 680), BackgroundTransparency = 0.7 })
     glowPulse:Play()
 
+    -- Cursed-energy glow под персонажем — пульсирует короткими импульсами
+    local cursedPulse = TweenService:Create(cursedGlow,
+        TweenInfo.new(0.9, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true, 0),
+        { Size = UDim2.fromOffset(360, 360), BackgroundTransparency = 0.5 })
+    cursedPulse:Play()
+
+    -- Персонаж — лёгкое "дыхание"
+    local charPulse = TweenService:Create(charImg,
+        TweenInfo.new(2.0, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true, 0),
+        { Size = UDim2.fromOffset(295, 295) })
+    charPulse:Play()
+
     -- Заголовок: лёгкое "дыхание" размера + плавающий градиент
     local titlePulse = TweenService:Create(title,
         TweenInfo.new(2.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true, 0),
-        { TextSize = 92 })
+        { TextSize = 70 })
     titlePulse:Play()
     task.spawn(function()
         local t0 = tick()
@@ -446,7 +506,8 @@ destroySplash = function()
     if not splashGui then return end
     local g = splashGui
     splashGui = nil
-    task.spawn(function()
+    -- Сначала пробуем плавный fade
+    pcall(function()
         local TweenService = game:GetService("TweenService")
         local fadeInfo = TweenInfo.new(0.5, Enum.EasingStyle.Sine, Enum.EasingDirection.Out)
         for _, d in ipairs(g:GetDescendants()) do
@@ -460,49 +521,85 @@ destroySplash = function()
                 pcall(function() TweenService:Create(d, fadeInfo, { Transparency = 1 }):Play() end)
             end
         end
-        local bgFrame = g:FindFirstChild("BG")
-        if bgFrame then
-            pcall(function() TweenService:Create(bgFrame, fadeInfo, { BackgroundTransparency = 1 }):Play() end)
-        end
-        task.wait(0.55)
-        pcall(function() g:Destroy() end)
-        _G.LunaSplashGui = nil
     end)
+    -- Параллельно — гарантированный Destroy через 0.55 сек, что бы ни произошло
+    task.delay(0.55, function() pcall(function() g:Destroy() end) end)
+    -- АБСОЛЮТНАЯ страховка: если task.delay упадёт — сносим через раз
+    task.spawn(function()
+        task.wait(1.5)
+        pcall(function() if g and g.Parent then g:Destroy() end end)
+    end)
+    _G.LunaSplashGui = nil
 end
 
 -- АБСОЛЮТНАЯ страховка: даже если ниже что-то крашнет — splash умрёт через 4 сек.
 -- Это решает баг "splash висит вечно", если Rayfield не загрузился.
 task.delay(4, function() pcall(destroySplash) end)
+-- ЕЩЁ ОДНА страховка прямо на корень — если 4-сек таймер не сработает,
+-- через 7 сек просто прибьём ScreenGui по ссылке через _G
+task.delay(7, function()
+    pcall(function()
+        if typeof(_G.LunaSplashGui) == "Instance" then
+            _G.LunaSplashGui:Destroy()
+            _G.LunaSplashGui = nil
+        end
+    end)
+end)
+
 
 
 -- ===== окно Rayfield =====
-local Window = Rayfield:CreateWindow({
-    Name = "Luna Hub | Sailor Piece",
-    LoadingTitle = "Luna Hub",
-    LoadingSubtitle = "загрузка модулей...",
-    Theme = "Amethyst",  -- глубокий тёмно-фиолетовый
-    -- RightControl как и раньше + дублирующий UIS-хендлер ниже на случай,
-    -- если Rayfield'овский биндинг подвиснет (баг библиотеки: после повторного
-    -- toggle через Rayfield:SetVisibility() свой ToggleUIKeybind иногда лочится).
-    ToggleUIKeybind = "RightControl",
-    DisableBuildWarnings = true,
-    -- ВАЖНО: автосохранение Rayfield-а сейчас ВЫКЛЮЧЕНО.
-    -- Если включить true — при следующем инжекте всё, что было включено
-    -- (Fly, NoClip, AutoFarm), сразу запустится. Это опасно.
-    -- Свой mini-конфиг — ниже, только для значений (слайдеры, выбор оружия,
-    -- скорость/гравитация и т.п.), без тогглов.
-    ConfigurationSaving = {
-        Enabled = false,
-        FolderName = "LunaHub",
-        FileName = "sailor_piece_v3"
-    },
-    Discord = { Enabled = false },
-    KeySystem = false
-})
+-- Оборачиваем в pcall: если CreateWindow упадёт (битая Theme, неверный keybind,
+-- старая версия Rayfield), сплэш будет немедленно убит и юзер увидит ошибку
+-- вместо "висящего на экране LUNA HUB".
+local Window
+do
+    local ok, win = pcall(function()
+        return Rayfield:CreateWindow({
+            Name = "Luna Hub | Sailor Piece",
+            LoadingTitle = "Luna Hub",
+            LoadingSubtitle = "загрузка модулей...",
+            Theme = "Amethyst",
+            ToggleUIKeybind = Enum.KeyCode.RightControl,
+            DisableBuildWarnings = true,
+            ConfigurationSaving = {
+                Enabled = false,
+                FolderName = "LunaHub",
+                FileName = "sailor_piece_v3"
+            },
+            Discord = { Enabled = false },
+            KeySystem = false
+        })
+    end)
+
+    if not ok or not win then
+        -- Фолбэк попытка БЕЗ ToggleUIKeybind и БЕЗ Theme — на случай если форк
+        -- Rayfield не поддерживает эти параметры в их текущей форме.
+        local ok2, win2 = pcall(function()
+            return Rayfield:CreateWindow({
+                Name = "Luna Hub | Sailor Piece",
+                LoadingTitle = "Luna Hub",
+                LoadingSubtitle = "загрузка модулей...",
+                ConfigurationSaving = { Enabled = false },
+                Discord = { Enabled = false },
+                KeySystem = false
+            })
+        end)
+        if ok2 and win2 then
+            Window = win2
+        else
+            -- Полный провал — гасим сплэш и выходим, чтоб не висело
+            pcall(destroySplash)
+            warn("[Luna] Не удалось создать окно Rayfield: " ..
+                tostring(win) .. " | fallback: " .. tostring(win2))
+            return
+        end
+    else
+        Window = win
+    end
+end
 
 -- Увеличиваем размер окна (Rayfield по умолчанию ~500x440 — для 7 табов мало).
--- Делаем 620x520. Window.Main — внутренний Frame, его размер можно поправить
--- безопасно (если форк библиотеки сменит структуру — pcall не даст крашу).
 pcall(function()
     if Window and Window.Main then
         Window.Main.Size = UDim2.new(0, 620, 0, 520)
