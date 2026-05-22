@@ -135,165 +135,327 @@ end)
 hiddenParent = hiddenParent or game:GetService("CoreGui")
 
 -- ====================================================
--- LOADING SPLASH (на весь экран, до загрузки Rayfield)
 -- ====================================================
--- Чёрный фон + градиентная полоса + название + прогресс-бар.
--- Видна 2 секунды (или пока Rayfield не загрузится). Удаляется по таймеру.
+-- LOADING SPLASH — магический круг призыва
+-- ====================================================
+-- На весь экран, видим 2 секунды, затем плавный fade-out за 0.5 сек.
+-- Композиция:
+--   - Чёрный фон с пульсирующим фиолетовым "глоу"
+--   - Внешний рунный круг (вращается по часовой)
+--   - Внутренний круг (вращается против часовой)
+--   - Центральная пятиконечная звезда (Roblox decal — рамповый алгоритм:
+--     вместо SVG-звезды берём 5 сходящихся к центру тонких лучей-Frame)
+--   - LUNA HUB поверх с двойным stroke (внешний фиолетовый, внутренний белый)
+--   - Прогресс-бар с градиентом + меняющийся статус
 local splashGui
+local destroySplash   -- forward
 do
+    local TweenService = game:GetService("TweenService")
+
     splashGui = Instance.new("ScreenGui")
     splashGui.Name = randomName()
     splashGui.IgnoreGuiInset = true
     splashGui.ResetOnSpawn = false
-    splashGui.DisplayOrder = 999999   -- поверх всего, включая UI игры
+    splashGui.DisplayOrder = 999999
     pcall(function()
         splashGui.Parent = hiddenParent
         if syn and syn.protect_gui then syn.protect_gui(splashGui) end
     end)
 
-    -- Чёрный фон
+    -- ---- Фон ----
     local bg = Instance.new("Frame")
     bg.Name = "BG"
     bg.Size = UDim2.fromScale(1, 1)
-    bg.BackgroundColor3 = Color3.fromRGB(8, 8, 14)
+    bg.BackgroundColor3 = Color3.fromRGB(6, 4, 12)
     bg.BorderSizePixel = 0
-    bg.BackgroundTransparency = 0
     bg.Parent = splashGui
 
-    -- Радиальный градиент-блюр в центре
+    -- Тонкая виньетка (плотный градиент к чёрному по краям)
+    local vignette = Instance.new("ImageLabel")
+    vignette.Name = "Vignette"
+    vignette.Size = UDim2.fromScale(1, 1)
+    vignette.BackgroundTransparency = 1
+    vignette.Image = "rbxassetid://5028857084"   -- стандартный radial gradient asset
+    vignette.ImageColor3 = Color3.fromRGB(0, 0, 0)
+    vignette.ImageTransparency = 0.35
+    vignette.ScaleType = Enum.ScaleType.Stretch
+    vignette.Parent = bg
+
+    -- Пульсирующий фиолетовый glow в центре (как аура заклинания)
     local glow = Instance.new("Frame")
-    glow.Name = "Glow"
     glow.AnchorPoint = Vector2.new(0.5, 0.5)
     glow.Position = UDim2.fromScale(0.5, 0.5)
-    glow.Size = UDim2.fromScale(0.7, 0.7)
-    glow.BackgroundColor3 = Color3.fromRGB(120, 60, 200)
+    glow.Size = UDim2.fromOffset(560, 560)
+    glow.BackgroundColor3 = Color3.fromRGB(140, 70, 230)
     glow.BackgroundTransparency = 0.85
     glow.BorderSizePixel = 0
     glow.Parent = bg
-    local gc = Instance.new("UICorner")
-    gc.CornerRadius = UDim.new(1, 0)
-    gc.Parent = glow
+    local glowCorner = Instance.new("UICorner"); glowCorner.CornerRadius = UDim.new(1, 0); glowCorner.Parent = glow
+    local glowGrad = Instance.new("UIGradient")
+    glowGrad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(180, 120, 255)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(60, 20, 110)),
+    })
+    glowGrad.Transparency = NumberSequence.new({
+        NumberSequenceKeypoint.new(0, 0.7),
+        NumberSequenceKeypoint.new(1, 1.0),
+    })
+    glowGrad.Parent = glow
 
-    -- Логотип / заголовок
+    -- ---- Магический круг (вращающийся) ----
+    -- Контейнер чтобы Rotation работал на оба круга независимо
+    local circleHolder = Instance.new("Frame")
+    circleHolder.AnchorPoint = Vector2.new(0.5, 0.5)
+    circleHolder.Position = UDim2.fromScale(0.5, 0.52)
+    circleHolder.Size = UDim2.fromOffset(420, 420)
+    circleHolder.BackgroundTransparency = 1
+    circleHolder.Parent = bg
+
+    -- Внешний круг (тонкое фиолетовое кольцо)
+    local outerRing = Instance.new("Frame")
+    outerRing.Name = "OuterRing"
+    outerRing.AnchorPoint = Vector2.new(0.5, 0.5)
+    outerRing.Position = UDim2.fromScale(0.5, 0.5)
+    outerRing.Size = UDim2.fromScale(1, 1)
+    outerRing.BackgroundTransparency = 1
+    outerRing.Parent = circleHolder
+    local oc = Instance.new("UICorner"); oc.CornerRadius = UDim.new(1, 0); oc.Parent = outerRing
+    local outerStroke = Instance.new("UIStroke")
+    outerStroke.Color = Color3.fromRGB(180, 120, 255)
+    outerStroke.Thickness = 2.5
+    outerStroke.Transparency = 0.15
+    outerStroke.Parent = outerRing
+
+    -- На внешнем кольце — 8 коротких "штрихов" (имитация рунных меток).
+    -- Просто 8 тонких Frame, расставленных по кругу через angle.
+    for i = 0, 7 do
+        local ang = math.rad(i * 45)
+        local r = 210
+        local mark = Instance.new("Frame")
+        mark.AnchorPoint = Vector2.new(0.5, 0.5)
+        mark.BackgroundColor3 = Color3.fromRGB(220, 180, 255)
+        mark.BorderSizePixel = 0
+        mark.Size = UDim2.fromOffset(14, 3)
+        mark.Position = UDim2.new(0.5, math.cos(ang) * r, 0.5, math.sin(ang) * r)
+        mark.Rotation = math.deg(ang)
+        mark.BackgroundTransparency = 0.1
+        mark.Parent = outerRing
+        local mc = Instance.new("UICorner"); mc.CornerRadius = UDim.new(1, 0); mc.Parent = mark
+    end
+
+    -- Внутренний круг (на 70% от внешнего, штрих толще, цвет другой)
+    local innerRing = Instance.new("Frame")
+    innerRing.Name = "InnerRing"
+    innerRing.AnchorPoint = Vector2.new(0.5, 0.5)
+    innerRing.Position = UDim2.fromScale(0.5, 0.5)
+    innerRing.Size = UDim2.fromScale(0.7, 0.7)
+    innerRing.BackgroundTransparency = 1
+    innerRing.Parent = circleHolder
+    local ic = Instance.new("UICorner"); ic.CornerRadius = UDim.new(1, 0); ic.Parent = innerRing
+    local innerStroke = Instance.new("UIStroke")
+    innerStroke.Color = Color3.fromRGB(255, 230, 180)   -- золотисто-белый
+    innerStroke.Thickness = 1.5
+    innerStroke.Transparency = 0.25
+    innerStroke.Parent = innerRing
+
+    -- 5 крупных рунных штрихов на внутреннем круге (пятиконечник)
+    for i = 0, 4 do
+        local ang = math.rad(i * 72 - 90)   -- начинаем сверху
+        local r = 137
+        local mark = Instance.new("Frame")
+        mark.AnchorPoint = Vector2.new(0.5, 0.5)
+        mark.BackgroundColor3 = Color3.fromRGB(255, 240, 200)
+        mark.BorderSizePixel = 0
+        mark.Size = UDim2.fromOffset(20, 4)
+        mark.Position = UDim2.new(0.5, math.cos(ang) * r, 0.5, math.sin(ang) * r)
+        mark.Rotation = math.deg(ang) + 90
+        mark.Parent = innerRing
+        local mc = Instance.new("UICorner"); mc.CornerRadius = UDim.new(1, 0); mc.Parent = mark
+    end
+
+    -- Центральная пентаграмма из 5 лучей.
+    -- Не векторная: 5 длинных тонких Frame, сходящихся к центру под углами 72°.
+    -- Базовая позиция = (0.5, 0.5), длина по AnchorPoint (0, 0.5).
+    local pentaHolder = Instance.new("Frame")
+    pentaHolder.AnchorPoint = Vector2.new(0.5, 0.5)
+    pentaHolder.Position = UDim2.fromScale(0.5, 0.5)
+    pentaHolder.Size = UDim2.fromOffset(2, 2)
+    pentaHolder.BackgroundTransparency = 1
+    pentaHolder.Parent = circleHolder
+
+    for i = 0, 4 do
+        local ang = i * 72 - 90
+        local ray = Instance.new("Frame")
+        ray.AnchorPoint = Vector2.new(0.5, 0.5)
+        ray.Position = UDim2.fromScale(0.5, 0.5)
+        ray.Size = UDim2.fromOffset(110, 2)
+        ray.Rotation = ang
+        ray.BackgroundColor3 = Color3.fromRGB(255, 220, 240)
+        ray.BorderSizePixel = 0
+        ray.BackgroundTransparency = 0.2
+        ray.Parent = pentaHolder
+    end
+
+    -- ---- Заголовок LUNA HUB (поверх круга) ----
     local title = Instance.new("TextLabel")
-    title.Name = "Title"
     title.AnchorPoint = Vector2.new(0.5, 0.5)
-    title.Position = UDim2.fromScale(0.5, 0.42)
-    title.Size = UDim2.new(0, 600, 0, 80)
+    title.Position = UDim2.fromScale(0.5, 0.52)
+    title.Size = UDim2.new(0, 720, 0, 110)
     title.BackgroundTransparency = 1
     title.Text = "LUNA HUB"
     title.Font = Enum.Font.GothamBlack
-    title.TextSize = 64
-    title.TextColor3 = Color3.fromRGB(235, 220, 255)
-    title.TextTransparency = 0
+    title.TextSize = 86
+    title.TextColor3 = Color3.fromRGB(245, 235, 255)
+    title.TextStrokeTransparency = 1   -- свой stroke ниже
     title.Parent = bg
 
-    local titleStroke = Instance.new("UIStroke")
-    titleStroke.Color = Color3.fromRGB(150, 80, 230)
-    titleStroke.Thickness = 2
-    titleStroke.Transparency = 0
-    titleStroke.Parent = title
+    -- Двойной stroke: внешний толстый фиолетовый + тонкий белый поверх
+    local titleStrokeOuter = Instance.new("UIStroke")
+    titleStrokeOuter.Color = Color3.fromRGB(140, 80, 230)
+    titleStrokeOuter.Thickness = 4
+    titleStrokeOuter.Transparency = 0
+    titleStrokeOuter.LineJoinMode = Enum.LineJoinMode.Round
+    titleStrokeOuter.Parent = title
 
+    -- Градиент по тексту (бело-фиолетовый сверху-вниз)
+    local titleGrad = Instance.new("UIGradient")
+    titleGrad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 240, 255)),
+        ColorSequenceKeypoint.new(0.5, Color3.fromRGB(220, 180, 255)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(170, 110, 230)),
+    })
+    titleGrad.Rotation = 90
+    titleGrad.Parent = title
+
+    -- Подзаголовок
     local subtitle = Instance.new("TextLabel")
-    subtitle.Name = "Subtitle"
     subtitle.AnchorPoint = Vector2.new(0.5, 0.5)
-    subtitle.Position = UDim2.fromScale(0.5, 0.5)
-    subtitle.Size = UDim2.new(0, 600, 0, 24)
+    subtitle.Position = UDim2.fromScale(0.5, 0.6)
+    subtitle.Size = UDim2.new(0, 600, 0, 22)
     subtitle.BackgroundTransparency = 1
-    subtitle.Text = "Sailor Piece • by Luna"
-    subtitle.Font = Enum.Font.Gotham
-    subtitle.TextSize = 16
-    subtitle.TextColor3 = Color3.fromRGB(170, 150, 220)
-    subtitle.TextTransparency = 0
+    subtitle.Text = "✦  S A I L O R   P I E C E  ✦"
+    subtitle.Font = Enum.Font.GothamMedium
+    subtitle.TextSize = 14
+    subtitle.TextColor3 = Color3.fromRGB(200, 180, 240)
+    subtitle.TextTransparency = 0.1
     subtitle.Parent = bg
 
-    -- Прогресс-бар
+    -- ---- Прогресс-бар ----
     local barBg = Instance.new("Frame")
-    barBg.Name = "BarBG"
     barBg.AnchorPoint = Vector2.new(0.5, 0.5)
-    barBg.Position = UDim2.fromScale(0.5, 0.62)
-    barBg.Size = UDim2.new(0, 320, 0, 4)
-    barBg.BackgroundColor3 = Color3.fromRGB(40, 30, 60)
+    barBg.Position = UDim2.fromScale(0.5, 0.78)
+    barBg.Size = UDim2.new(0, 380, 0, 6)
+    barBg.BackgroundColor3 = Color3.fromRGB(30, 20, 50)
     barBg.BorderSizePixel = 0
     barBg.Parent = bg
-    local bbc = Instance.new("UICorner")
-    bbc.CornerRadius = UDim.new(1, 0)
-    bbc.Parent = barBg
+    local bbc = Instance.new("UICorner"); bbc.CornerRadius = UDim.new(1, 0); bbc.Parent = barBg
 
     local bar = Instance.new("Frame")
-    bar.Name = "Bar"
     bar.AnchorPoint = Vector2.new(0, 0.5)
     bar.Position = UDim2.new(0, 0, 0.5, 0)
     bar.Size = UDim2.new(0, 0, 1, 0)
-    bar.BackgroundColor3 = Color3.fromRGB(170, 100, 250)
+    bar.BackgroundColor3 = Color3.fromRGB(180, 120, 255)
     bar.BorderSizePixel = 0
     bar.Parent = barBg
-    local bc = Instance.new("UICorner")
-    bc.CornerRadius = UDim.new(1, 0)
-    bc.Parent = bar
+    local bc = Instance.new("UICorner"); bc.CornerRadius = UDim.new(1, 0); bc.Parent = bar
 
-    -- статус под прогресс-баром
+    local barGrad = Instance.new("UIGradient")
+    barGrad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 200, 240)),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(150, 80, 230)),
+    })
+    barGrad.Parent = bar
+
+    -- статус
     local status = Instance.new("TextLabel")
     status.AnchorPoint = Vector2.new(0.5, 0.5)
-    status.Position = UDim2.fromScale(0.5, 0.68)
+    status.Position = UDim2.fromScale(0.5, 0.83)
     status.Size = UDim2.new(0, 600, 0, 18)
     status.BackgroundTransparency = 1
-    status.Text = "загрузка..."
+    status.Text = "плетение заклинания…"
     status.Font = Enum.Font.Gotham
     status.TextSize = 13
-    status.TextColor3 = Color3.fromRGB(140, 130, 180)
+    status.TextColor3 = Color3.fromRGB(160, 145, 200)
     status.Parent = bg
 
-    -- Анимация: бар заполняется до 100% за 2 сек
+    -- ---- Анимации ----
+    -- Внешний круг крутим по часовой, внутренний — против часовой (бесконечно).
+    -- Делаем через Tween с RepeatCount = -1 (зацикленно).
+    local spinOut = TweenService:Create(outerRing,
+        TweenInfo.new(8, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut, -1, false, 0),
+        { Rotation = 360 })
+    spinOut:Play()
+    local spinIn = TweenService:Create(innerRing,
+        TweenInfo.new(6, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut, -1, false, 0),
+        { Rotation = -360 })
+    spinIn:Play()
+    -- Пентаграмма медленно вращается тоже (ту же сторону, что внешний)
+    local spinPenta = TweenService:Create(pentaHolder,
+        TweenInfo.new(12, Enum.EasingStyle.Linear, Enum.EasingDirection.InOut, -1, false, 0),
+        { Rotation = 360 })
+    spinPenta:Play()
+
+    -- Glow пульсирует (туда-сюда) каждые 1.4 сек
+    local glowPulse = TweenService:Create(glow,
+        TweenInfo.new(1.4, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true, 0),
+        { Size = UDim2.fromOffset(680, 680), BackgroundTransparency = 0.7 })
+    glowPulse:Play()
+
+    -- Заголовок: лёгкое "дыхание" размера + плавающий градиент
+    local titlePulse = TweenService:Create(title,
+        TweenInfo.new(2.5, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true, 0),
+        { TextSize = 92 })
+    titlePulse:Play()
     task.spawn(function()
-        local TweenService = game:GetService("TweenService")
-        local ti = TweenInfo.new(2.0, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
-        pcall(function()
-            TweenService:Create(bar, ti, { Size = UDim2.new(1, 0, 1, 0) }):Play()
-        end)
-        pcall(function()
-            TweenService:Create(glow, TweenInfo.new(2.0, Enum.EasingStyle.Sine,
-                Enum.EasingDirection.InOut, -1, true),
-                { BackgroundTransparency = 0.7, Size = UDim2.fromScale(0.85, 0.85) }):Play()
-        end)
+        local t0 = tick()
+        while splashGui do
+            local off = (tick() - t0) * 0.35
+            titleGrad.Offset = Vector2.new(0, math.sin(off) * 0.15)
+            task.wait(1/30)
+        end
     end)
 
-    -- Анимация статуса: меняющиеся точки + смена текста по этапам
+    -- Прогресс-бар: за 1.8с до 100%
+    TweenService:Create(bar,
+        TweenInfo.new(1.8, Enum.EasingStyle.Quart, Enum.EasingDirection.Out),
+        { Size = UDim2.new(1, 0, 1, 0) }):Play()
+
+    -- Статус по этапам
     task.spawn(function()
         local stages = {
-            "проверка окружения",
-            "подгрузка модулей",
-            "инициализация UI",
-            "почти готово",
+            "плетение заклинания",
+            "призыв интерфейса",
+            "настройка камней",
+            "связь установлена",
         }
         local i = 1
-        local dots = ""
         while splashGui and i <= #stages do
             for n = 1, 4 do
                 if not splashGui then return end
-                dots = string.rep(".", n - 1)
-                status.Text = stages[i] .. dots
-                task.wait(0.12)
+                status.Text = stages[i] .. string.rep(".", n - 1)
+                task.wait(0.11)
             end
             i = i + 1
         end
     end)
 
-    _G.LunaSplashGui = splashGui   -- чтоб удалить если что-то пошло не так
+    _G.LunaSplashGui = splashGui
 end
 
-local function destroySplash()
+destroySplash = function()
     if not splashGui then return end
     local g = splashGui
     splashGui = nil
     task.spawn(function()
         local TweenService = game:GetService("TweenService")
-        local fadeInfo = TweenInfo.new(0.4, Enum.EasingStyle.Sine, Enum.EasingDirection.Out)
+        local fadeInfo = TweenInfo.new(0.5, Enum.EasingStyle.Sine, Enum.EasingDirection.Out)
         for _, d in ipairs(g:GetDescendants()) do
             if d:IsA("Frame") then
                 pcall(function() TweenService:Create(d, fadeInfo, { BackgroundTransparency = 1 }):Play() end)
             elseif d:IsA("TextLabel") then
                 pcall(function() TweenService:Create(d, fadeInfo, { TextTransparency = 1 }):Play() end)
+            elseif d:IsA("ImageLabel") then
+                pcall(function() TweenService:Create(d, fadeInfo, { ImageTransparency = 1 }):Play() end)
             elseif d:IsA("UIStroke") then
                 pcall(function() TweenService:Create(d, fadeInfo, { Transparency = 1 }):Play() end)
             end
@@ -302,11 +464,16 @@ local function destroySplash()
         if bgFrame then
             pcall(function() TweenService:Create(bgFrame, fadeInfo, { BackgroundTransparency = 1 }):Play() end)
         end
-        task.wait(0.45)
+        task.wait(0.55)
         pcall(function() g:Destroy() end)
         _G.LunaSplashGui = nil
     end)
 end
+
+-- АБСОЛЮТНАЯ страховка: даже если ниже что-то крашнет — splash умрёт через 4 сек.
+-- Это решает баг "splash висит вечно", если Rayfield не загрузился.
+task.delay(4, function() pcall(destroySplash) end)
+
 
 -- ===== окно Rayfield =====
 local Window = Rayfield:CreateWindow({
@@ -2481,8 +2648,8 @@ do
     end))
 end
 
--- Убираем splash через 2 сек (или сразу если уже всё готово)
-task.delay(2.0, function() pcall(destroySplash) end)
+-- Убираем splash через 2.2 сек (совпадает с финишем анимации прогресс-бара)
+task.delay(2.2, function() pcall(destroySplash) end)
 
 notify("Luna Hub загружен. RightCtrl — открыть/закрыть меню", 4)
 print("[Luna] ready | game: " .. game.Name)
