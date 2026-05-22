@@ -627,8 +627,20 @@ local sp_questNpcName  = ""
 local sp_mobBaseName   = ""
 local sp_scanRadius    = 100
 local sp_searchRadius  = 200
+-- Длительность охоты квестового цикла
 local sp_huntDuration  = 60
 local sp_postQuestWait = 3   -- legacy, сейчас baked в spTakeQuestFrom
+
+-- Free Combat: бить без квеста (пропускает фазу TakeQuest, сразу Hunting).
+-- Полезно когда в дропдауне моба ты выбрал босса и не хочешь возиться с NPC.
+local sp_freeCombat = false
+
+-- Anti-Damage Anchor: вместо парения 7 ст. над мобом — поднимает игрока
+-- ВЫСОКО (50 ст. по умолчанию) и якорит HRP. Большинство melee/AOE
+-- атак боссов не достают на такой высоте, и физика игрока заморожена.
+-- Используется как замена сломанному ForceField God Mode'у.
+local sp_antiDamage = false
+local sp_antiDamageHeight = 50
 
 -- Бой
 local sp_attackDelay   = 0.25
@@ -954,11 +966,19 @@ local function spHoverAbove(mob)
         or mob:FindFirstChild("HumanoidRootPart") or mob.PrimaryPart
     if not mobHead then return end
     local headPos = mobHead.Position
-    local eye = headPos + Vector3.new(0, sp_hoverHeight, 0)
+    -- Если включен Anti-Damage — поднимаемся на высоту 50 ст. + якорим HRP
+    local height = sp_antiDamage and sp_antiDamageHeight or sp_hoverHeight
+    local eye = headPos + Vector3.new(0, height, 0)
     pcall(function()
         hum.PlatformStand = false
         hrp.AssemblyLinearVelocity = Vector3.zero
         hrp.CFrame = CFrame.lookAt(eye, headPos)
+        -- Anti-Damage — якорим HRP, чтобы knockback не сдвинул вниз
+        if sp_antiDamage then
+            if not hrp.Anchored then hrp.Anchored = true end
+        elseif hrp.Anchored then
+            hrp.Anchored = false
+        end
     end)
 end
 
@@ -1003,8 +1023,9 @@ end
 -- ====================================================
 local function spStart()
     if sp_loopThread then return end
-    if _isPlaceholder(sp_questNpcName) then
-        notify("Сначала Scan + выбор NPC")
+    -- Free Combat: пропускаем требование выбрать NPC
+    if not sp_freeCombat and _isPlaceholder(sp_questNpcName) then
+        notify("Сначала Scan + выбор NPC (или включи Free Combat)")
         return
     end
     if _isPlaceholder(sp_mobBaseName) then
@@ -1016,7 +1037,8 @@ local function spStart()
     end
 
     sp_enabled = true
-    _G.QuestState = "TakeQuest"
+    -- Free Combat начинает сразу с Hunting
+    _G.QuestState = sp_freeCombat and "Hunting" or "TakeQuest"
 
     sp_loopThread = task.spawn(function()
         while sp_enabled do
@@ -1026,63 +1048,79 @@ local function spStart()
                 task.wait(1)
             elseif _G.QuestState == "TakeQuest" then
                 sp_currentMob = nil
-                local npc = spFindQuestNpc(sp_questNpcName)
-                if npc then
-                    notify("Беру квест у " .. sp_questNpcName)
-                    spTakeQuestFrom(npc)
+                if sp_freeCombat then
+                    -- В режиме Free Combat — никогда не ходим к NPC, сразу в Hunting
                     _G.QuestState = "Hunting"
                 else
-                    notify("NPC не найден: " .. sp_questNpcName)
-                    task.wait(2)
+                    local npc = spFindQuestNpc(sp_questNpcName)
+                    if npc then
+                        notify("Беру квест у " .. sp_questNpcName)
+                        spTakeQuestFrom(npc)
+                        _G.QuestState = "Hunting"
+                    else
+                        notify("NPC не найден: " .. sp_questNpcName)
+                        task.wait(2)
+                    end
                 end
             elseif _G.QuestState == "Hunting" then
                 local huntStart = tick()
                 notify(("Hunt %ds: %s"):format(sp_huntDuration, sp_mobBaseName))
                 while sp_enabled
                     and _G.QuestState == "Hunting"
-                    and (tick() - huntStart) < sp_huntDuration
+                    -- Free Combat игнорирует таймер охоты (фармим вечно)
+                    and (sp_freeCombat or (tick() - huntStart) < sp_huntDuration)
                 do
                     local mob = spFindMob(sp_mobBaseName)
                     if not mob then
-                        notify("Моба нет — обратно к NPC")
-                        break
-                    end
-                    sp_currentMob = mob
-
-                    if not godModeEnabled then
-                        local p = spModelPos(mob)
-                        if p then
-                            spSmoothTeleportTo(CFrame.lookAt(
-                                p + Vector3.new(0, sp_hoverHeight, 0), p))
+                        if sp_freeCombat then
+                            -- Free Combat: ждём респавна моба, не возвращаемся к NPC
+                            task.wait(2)
+                        else
+                            notify("Моба нет — обратно к NPC")
+                            break
                         end
-                    end
+                    else
+                        sp_currentMob = mob
 
-                    local skillKeys = spActiveSkillKeys()
-                    local skillIdx, lastSkill = 1, tick()
-                    local mobHum = mob:FindFirstChildOfClass("Humanoid")
-
-                    while sp_enabled
-                        and _G.QuestState == "Hunting"
-                        and mob.Parent
-                        and mobHum and mobHum.Health > 0
-                        and (tick() - huntStart) < sp_huntDuration
-                    do
-                        spHoverAbove(mob)
-                        spMouseClick()
-                        if #skillKeys > 0 and (tick() - lastSkill) >= sp_skillDelay then
-                            spPressKey(skillKeys[skillIdx])
-                            skillIdx = (skillIdx % #skillKeys) + 1
-                            lastSkill = tick()
+                        if not godModeEnabled and not sp_antiDamage then
+                            local p = spModelPos(mob)
+                            if p then
+                                spSmoothTeleportTo(CFrame.lookAt(
+                                    p + Vector3.new(0, sp_hoverHeight, 0), p))
+                            end
                         end
-                        task.wait(sp_attackDelay)
+
+                        local skillIdx, lastSkill = 1, tick()
+                        local mobHum = mob:FindFirstChildOfClass("Humanoid")
+
+                        while sp_enabled
+                            and _G.QuestState == "Hunting"
+                            and mob.Parent
+                            and mobHum and mobHum.Health > 0
+                            and (sp_freeCombat or (tick() - huntStart) < sp_huntDuration)
+                        do
+                            spHoverAbove(mob)
+                            spMouseClick()
+                            -- ВАЖНО: пересобираем массив скиллов КАЖДЫЙ цикл,
+                            -- чтобы тогглы Z/X/C/V/F работали в реальном времени.
+                            local skillKeys = spActiveSkillKeys()
+                            if #skillKeys > 0 and (tick() - lastSkill) >= sp_skillDelay then
+                                -- Циклический индекс на текущей длине массива
+                                if skillIdx > #skillKeys then skillIdx = 1 end
+                                spPressKey(skillKeys[skillIdx])
+                                skillIdx = (skillIdx % #skillKeys) + 1
+                                lastSkill = tick()
+                            end
+                            task.wait(sp_attackDelay)
+                        end
+                        sp_currentMob = nil
+                        task.wait(0.1)
                     end
-                    sp_currentMob = nil
-                    task.wait(0.1)
                 end
-                _G.QuestState = "TakeQuest"
+                _G.QuestState = sp_freeCombat and "Hunting" or "TakeQuest"
                 task.wait(0.3)
             else
-                _G.QuestState = "TakeQuest"
+                _G.QuestState = sp_freeCombat and "Hunting" or "TakeQuest"
                 task.wait(0.2)
             end
             task.wait(0.05)
@@ -1102,6 +1140,10 @@ end
 -- ====================================================
 -- RAID BOSSES
 -- ====================================================
+-- Стартовый seed-список (то что "обычно" есть в игре). При нажатии "Авто-скан"
+-- этот список расширится тем, что реально найдётся в workspace.NPCs.
+-- Имена нормализуются: суффиксы _Normal/_Medium/_Hard/_Extreme/_Easy/_Insane
+-- и хвостовые цифры срезаются, чтобы string.find ловил все варианты сразу.
 local EliteBosses = {
     ["Black Reaper"] = "BlackReaperBoss",
     ["Monkey Boss"]  = "Monkey Boss",
@@ -1110,6 +1152,69 @@ local EliteBosses = {
 local EliteBossOrder = { "Black Reaper", "Monkey Boss", "Thief Boss" }
 local sp_bossDisplayName = EliteBossOrder[1]
 local sp_bossRootName    = EliteBosses[sp_bossDisplayName]
+
+-- Утилита: нормализация имени модели в "корневое" имя босса.
+-- "BlackReaperBoss_Hard" -> "BlackReaperBoss"
+-- "FireDragon3"          -> "FireDragon"
+-- "Boss_Easy"            -> "Boss" (если хочется, можно отключить)
+local function _spStripBossSuffix(name)
+    if type(name) ~= "string" then return name end
+    -- Сначала срезаем суффикс сложности
+    local stripped = name
+        :gsub("_Easy$", "")
+        :gsub("_Normal$", "")
+        :gsub("_Medium$", "")
+        :gsub("_Hard$", "")
+        :gsub("_Extreme$", "")
+        :gsub("_Insane$", "")
+        :gsub("_Nightmare$", "")
+        :gsub("_Boss$", "")  -- "Sukuna_Boss" -> "Sukuna"
+    -- Потом срезаем хвостовые цифры
+    local cleaned = stripped:gsub("%d+$", "")
+    if cleaned == "" then return stripped end
+    return cleaned
+end
+
+-- Эвристика "это похоже на босса": в имени есть Boss/Lord/King/Captain/Demon/Lord
+-- ИЛИ Humanoid.MaxHealth заметно больше среднего рядового моба (>= 1000).
+local function _spLooksLikeBoss(model, hum)
+    local n = model.Name:lower()
+    if n:find("boss")    or n:find("lord")    or n:find("king")
+       or n:find("queen") or n:find("demon")   or n:find("captain")
+       or n:find("titan") or n:find("reaper")  or n:find("master")
+       or n:find("admiral") or n:find("warlord")
+    then
+        return true
+    end
+    -- Толстое HP = вероятно босс
+    if hum and hum.MaxHealth and hum.MaxHealth >= 1000 then return true end
+    return false
+end
+
+-- Авто-сканер ВСЕХ боссов в workspace.NPCs (без радиуса — пробегает карту целиком).
+-- Возвращает Map<DisplayName, RootName>. Имя в дропдауне = очищенный root,
+-- root = строка для string.find (чтобы ловить _Hard/_Extreme).
+local function spAutoScanBosses()
+    local found = {}
+    local order = {}
+    local folder = spGetNpcFolder()
+    if folder then
+        for _, m in ipairs(folder:GetChildren()) do
+            if m:IsA("Model") then
+                local hum = m:FindFirstChildOfClass("Humanoid")
+                if _spLooksLikeBoss(m, hum) then
+                    local root = _spStripBossSuffix(m.Name)
+                    if root and root ~= "" and not found[root] then
+                        found[root] = root   -- display = root
+                        table.insert(order, root)
+                    end
+                end
+            end
+        end
+    end
+    table.sort(order)
+    return found, order
+end
 
 local function spFindBoss(rootName)
     if not rootName or rootName == "" then return nil end
@@ -1159,7 +1264,7 @@ local function spBossStart()
                     end
                 else
                     sp_currentMob = boss
-                    if not godModeEnabled then
+                    if not godModeEnabled and not sp_antiDamage then
                         local p = spModelPos(boss)
                         if p then
                             spSmoothTeleportTo(CFrame.lookAt(
@@ -1167,16 +1272,23 @@ local function spBossStart()
                         end
                     end
 
-                    local skillKeys = spActiveSkillKeys()
                     local skillIdx, lastSkill = 1, tick()
 
                     while sp_bossEnabled
                         and boss.Parent
                         and bossHum and bossHum.Health > 0
                     do
+                        -- Освежаем ссылку на Humanoid каждый кадр —
+                        -- если босс был перерождён или модель пересобрана.
+                        bossHum = boss:FindFirstChildOfClass("Humanoid") or bossHum
                         spHoverAbove(boss)
                         spMouseClick()
+                        -- ПЕРЕСОБИРАЕМ skillKeys на каждой итерации, чтобы тогглы
+                        -- Z/X/C/V/F работали в реальном времени (раньше snapshot
+                        -- делался ОДИН раз перед боем — toggle игнорировался).
+                        local skillKeys = spActiveSkillKeys()
                         if #skillKeys > 0 and (tick() - lastSkill) >= sp_skillDelay then
+                            if skillIdx > #skillKeys then skillIdx = 1 end
                             spPressKey(skillKeys[skillIdx])
                             skillIdx = (skillIdx % #skillKeys) + 1
                             lastSkill = tick()
@@ -1245,13 +1357,17 @@ stopGodMode = function()
     if godConn then godConn:Disconnect(); godConn = nil end
     for _, c in ipairs(godPartsConn) do pcall(function() c:Disconnect() end) end
     table.clear(godPartsConn)
-    -- Возвращаем коллизию
+    -- Возвращаем коллизию + снимаем якорь HRP (если был от Anti-Damage режима)
     local char = safeGetCharacter()
     if char then
         for _, p in ipairs(char:GetChildren()) do
             if p:IsA("BasePart") then
                 pcall(function() p.CanCollide = true end)
             end
+        end
+        local hrp = char:FindFirstChild("HumanoidRootPart")
+        if hrp and hrp.Anchored then
+            pcall(function() hrp.Anchored = false end)
         end
     end
     table.clear(godPartsCache)
@@ -1261,12 +1377,11 @@ local function startGodMode()
     stopGodMode()
     godRebuildCache()
 
-    -- Throttle: noclip достаточно проверять 30 раз/сек, hover — 60 раз/сек,
-    -- но только если позиция моба сдвинулась >0.5 ст. Это спасает FPS на боссах
-    -- которые стоят на месте 90% времени.
+    -- Throttle: noclip достаточно проверять 30 раз/сек.
+    -- Hover же пишем КАЖДЫЙ кадр — иначе игрок падает под карту, когда босс стоит
+    -- (старый код gate'ил hover за движением >0.5 ст. → если босс не двигался,
+    -- gravity тащил персонажа вниз через провалившийся CanCollide=false).
     local lastNoclip = 0
-    local lastHoverPos = Vector3.zero
-    local lastHoverHead = nil
 
     godConn = RunService.Heartbeat:Connect(function()
         if not godModeEnabled then
@@ -1284,27 +1399,35 @@ local function startGodMode()
             end
         end
 
-        -- 2) Hover над целью — пересчитываем CFrame только при движении моба
+        -- 2) Hover над целью — каждый кадр (без гейта на движение!).
+        --    Если активен Anti-Damage — поднимаемся гораздо выше + якорим HRP.
         local mob = sp_currentMob
         if mob and mob.Parent then
             local mobHead = mob:FindFirstChild("Head")
                 or mob:FindFirstChild("HumanoidRootPart") or mob.PrimaryPart
             if mobHead then
                 local headPos = mobHead.Position
-                if (headPos - lastHoverPos).Magnitude > 0.5 or mobHead ~= lastHoverHead then
-                    lastHoverPos = headPos
-                    lastHoverHead = mobHead
-                    local char = safeGetCharacter()
-                    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-                    if hrp then
-                        local eye = headPos + Vector3.new(0, sp_hoverHeight, 0)
-                        hrp.CFrame = CFrame.lookAt(eye, headPos)
-                        hrp.AssemblyLinearVelocity = Vector3.zero
+                local char = safeGetCharacter()
+                local hrp = char and char:FindFirstChild("HumanoidRootPart")
+                if hrp then
+                    local height = sp_antiDamage and sp_antiDamageHeight or sp_hoverHeight
+                    local eye = headPos + Vector3.new(0, height, 0)
+                    hrp.CFrame = CFrame.lookAt(eye, headPos)
+                    hrp.AssemblyLinearVelocity = Vector3.zero
+                    -- В Anti-Damage режиме якорим HRP, чтобы серверная физика
+                    -- НЕ могла нас сдвинуть вниз (knockback от босса etc.)
+                    if sp_antiDamage then
+                        if not hrp.Anchored then hrp.Anchored = true end
+                    elseif hrp.Anchored then
+                        hrp.Anchored = false
                     end
                 end
             end
         else
-            lastHoverHead = nil
+            -- Цели нет — снимаем якорь, иначе игрок зависнет навсегда
+            local char = safeGetCharacter()
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            if hrp and hrp.Anchored then hrp.Anchored = false end
         end
     end)
     track(godConn)
@@ -1719,21 +1842,55 @@ local SBossSec = SailorTab:CreateSection("Рейдовые боссы")
 
 SailorTab:CreateParagraph({
     Title = "Что это",
-    Content = "Отдельный режим. Игнорирует квестовый NPC, ищет выбранного босса по корню имени (например «BlackReaperBoss» поймает любую сложность: _Normal, _Medium, _Hard, _Extreme). Скиллы и слот оружия — общие с обычным фармом."
+    Content = "Отдельный режим. Игнорирует квестовый NPC, ищет выбранного босса по корню имени (например «BlackReaperBoss» поймает любую сложность: _Normal, _Medium, _Hard, _Extreme).\n\nЕсли в дропдауне нет нужного босса — жми «Авто-скан карты». Скрипт пробежит workspace.NPCs и найдёт ВСЕХ кто похож на босса (по имени или большому HP)."
 })
 
-SailorTab:CreateDropdown({
+-- Динамический список боссов: при auto-scan заменяется на найденное.
+-- Стартовый seed — EliteBossOrder, чтобы дропдаун не был пустым при первом запуске.
+local sp_bossList    = {}     -- Map<displayName, rootName>
+local sp_bossListOrder = {}   -- упорядоченный массив displayName'ов
+for _, k in ipairs(EliteBossOrder) do
+    sp_bossList[k] = EliteBosses[k]
+    table.insert(sp_bossListOrder, k)
+end
+
+local bossDropdown
+bossDropdown = SailorTab:CreateDropdown({
     Name = "Босс",
-    Options = EliteBossOrder,
+    Options = sp_bossListOrder,
     CurrentOption = { sp_bossDisplayName },
     MultipleOptions = false,
     Flag = "sp_bossPick",
     Callback = function(opt)
         local v = (type(opt) == "table") and opt[1] or opt
-        if v and EliteBosses[v] then
+        if v and sp_bossList[v] then
             sp_bossDisplayName = v
-            sp_bossRootName    = EliteBosses[v]
+            sp_bossRootName    = sp_bossList[v]
         end
+    end
+})
+
+SailorTab:CreateButton({
+    Name = "Авто-скан карты — все боссы",
+    Callback = function()
+        local found, order = spAutoScanBosses()
+        if #order == 0 then
+            notify("Не нашёл ни одного босса в workspace.NPCs")
+            return
+        end
+        sp_bossList = found
+        sp_bossListOrder = order
+        if bossDropdown and bossDropdown.Refresh then
+            pcall(bossDropdown.Refresh, bossDropdown, sp_bossListOrder)
+        end
+        -- Если текущий выбранный босс остался в списке — оставляем,
+        -- иначе берём первого из списка
+        if not sp_bossList[sp_bossDisplayName] then
+            sp_bossDisplayName = sp_bossListOrder[1]
+            sp_bossRootName    = sp_bossList[sp_bossDisplayName]
+        end
+        notify(("Найдено боссов: %d"):format(#sp_bossListOrder))
+        for _, n in ipairs(sp_bossListOrder) do print("  Boss: " .. n) end
     end
 })
 
@@ -1746,9 +1903,43 @@ SailorTab:CreateToggle({
     end
 })
 
+SailorTab:CreateDivider()
+SailorTab:CreateSection("Свободный бой / Защита")
+
 SailorTab:CreateParagraph({
-    Title = "Совет",
-    Content = "При включении этого тумблера обычный квестовый авто-фарм отключится автоматически — нельзя одновременно фармить квесты и босса."
+    Title = "Free Combat и Anti-Damage",
+    Content = "▸ «Free Combat» — обычный авто-фарм бьёт ЛЮБОГО моба из дропдауна без захода к NPC за квестом. Удобно когда выбрал босса через Scan Mobs.\n\n▸ «Anti-Damage» — поднимает игрока на 50 ст. над целью + якорит HRP. Большинство melee-боссов и AOE на такой высоте просто не достанут. Это надёжнее ForceField God Mode'а от шотов.\n\nОба совместимы и с квестовым фармом, и с Boss-фармом."
+})
+
+SailorTab:CreateToggle({
+    Name = "Free Combat (бить без квеста)",
+    CurrentValue = false,
+    Flag = "sp_freeCombat",
+    Callback = function(v) sp_freeCombat = v end
+})
+
+SailorTab:CreateToggle({
+    Name = "Anti-Damage Anchor (50 ст. + якорь)",
+    CurrentValue = false,
+    Flag = "sp_antiDamage",
+    Callback = function(v)
+        sp_antiDamage = v
+        -- Если выключаем — немедленно снимаем якорь
+        if not v then
+            local hrp = safeGetHRP(safeGetCharacter())
+            if hrp and hrp.Anchored then hrp.Anchored = false end
+        end
+    end
+})
+
+SailorTab:CreateSlider({
+    Name = "Высота Anti-Damage",
+    Range = { 20, 200 },
+    Increment = 5,
+    Suffix = " ст.",
+    CurrentValue = sp_antiDamageHeight,
+    Flag = "sp_antiDamageHeight",
+    Callback = function(v) sp_antiDamageHeight = v end
 })
 
 
@@ -2603,6 +2794,7 @@ local function _serializeSettings()
         sp_weaponSlot   = sp_weaponSlot,
         sp_useZ = sp_useZ, sp_useX = sp_useX, sp_useC = sp_useC,
         sp_useV = sp_useV, sp_useF = sp_useF,
+        sp_antiDamageHeight = sp_antiDamageHeight,
         speedMultiplier = speedMultiplier,
         aimbotFov       = aimbotFov,
         aimbotSmooth    = aimbotSmooth,
@@ -2626,6 +2818,7 @@ local function _applySettings(t)
     if t.sp_useC ~= nil then sp_useC = t.sp_useC end
     if t.sp_useV ~= nil then sp_useV = t.sp_useV end
     if t.sp_useF ~= nil then sp_useF = t.sp_useF end
+    sp_antiDamageHeight = t.sp_antiDamageHeight or sp_antiDamageHeight
     speedMultiplier = t.speedMultiplier or speedMultiplier
     aimbotFov       = t.aimbotFov       or aimbotFov
     aimbotSmooth    = t.aimbotSmooth    or aimbotSmooth
@@ -2700,10 +2893,17 @@ _G.LunaUnload = function()
     aimbotEnabled = false
     sp_enabled = false; sp_bossEnabled = false
     godModeEnabled = false; godMode2Enabled = false
+    sp_antiDamage = false   -- сбросить чтобы snять якорь HRP
 
     pcall(stopFly); pcall(stopInfJump); pcall(stopNoClip); pcall(stopAimbot)
     pcall(stopEspLoop); pcall(spStop); pcall(spBossStop)
     pcall(stopGodMode); pcall(stopGodMode2)
+
+    -- Снимаем якорь персонажа на случай если Anti-Damage был включен
+    pcall(function()
+        local hrp = safeGetHRP(safeGetCharacter())
+        if hrp and hrp.Anchored then hrp.Anchored = false end
+    end)
 
     for _, c in ipairs(allConnections) do
         pcall(function() c:Disconnect() end)
