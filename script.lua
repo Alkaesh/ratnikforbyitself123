@@ -25,7 +25,7 @@ pcall(function()
         local ok, hui = pcall(gethui)
         if ok and hui then purge(hui) end
     end
-    for _, k in ipairs({"LunaTracerGui", "LunaFovGui", "LunaWindowGui"}) do
+    for _, k in ipairs({"LunaTracerGui", "LunaFovGui", "LunaWindowGui", "LunaSplashGui"}) do
         if typeof(_G[k]) == "Instance" then
             pcall(function() _G[k]:Destroy() end)
             _G[k] = nil
@@ -134,19 +134,198 @@ pcall(function()
 end)
 hiddenParent = hiddenParent or game:GetService("CoreGui")
 
+-- ====================================================
+-- LOADING SPLASH (на весь экран, до загрузки Rayfield)
+-- ====================================================
+-- Чёрный фон + градиентная полоса + название + прогресс-бар.
+-- Видна 2 секунды (или пока Rayfield не загрузится). Удаляется по таймеру.
+local splashGui
+do
+    splashGui = Instance.new("ScreenGui")
+    splashGui.Name = randomName()
+    splashGui.IgnoreGuiInset = true
+    splashGui.ResetOnSpawn = false
+    splashGui.DisplayOrder = 999999   -- поверх всего, включая UI игры
+    pcall(function()
+        splashGui.Parent = hiddenParent
+        if syn and syn.protect_gui then syn.protect_gui(splashGui) end
+    end)
+
+    -- Чёрный фон
+    local bg = Instance.new("Frame")
+    bg.Name = "BG"
+    bg.Size = UDim2.fromScale(1, 1)
+    bg.BackgroundColor3 = Color3.fromRGB(8, 8, 14)
+    bg.BorderSizePixel = 0
+    bg.BackgroundTransparency = 0
+    bg.Parent = splashGui
+
+    -- Радиальный градиент-блюр в центре
+    local glow = Instance.new("Frame")
+    glow.Name = "Glow"
+    glow.AnchorPoint = Vector2.new(0.5, 0.5)
+    glow.Position = UDim2.fromScale(0.5, 0.5)
+    glow.Size = UDim2.fromScale(0.7, 0.7)
+    glow.BackgroundColor3 = Color3.fromRGB(120, 60, 200)
+    glow.BackgroundTransparency = 0.85
+    glow.BorderSizePixel = 0
+    glow.Parent = bg
+    local gc = Instance.new("UICorner")
+    gc.CornerRadius = UDim.new(1, 0)
+    gc.Parent = glow
+
+    -- Логотип / заголовок
+    local title = Instance.new("TextLabel")
+    title.Name = "Title"
+    title.AnchorPoint = Vector2.new(0.5, 0.5)
+    title.Position = UDim2.fromScale(0.5, 0.42)
+    title.Size = UDim2.new(0, 600, 0, 80)
+    title.BackgroundTransparency = 1
+    title.Text = "LUNA HUB"
+    title.Font = Enum.Font.GothamBlack
+    title.TextSize = 64
+    title.TextColor3 = Color3.fromRGB(235, 220, 255)
+    title.TextTransparency = 0
+    title.Parent = bg
+
+    local titleStroke = Instance.new("UIStroke")
+    titleStroke.Color = Color3.fromRGB(150, 80, 230)
+    titleStroke.Thickness = 2
+    titleStroke.Transparency = 0
+    titleStroke.Parent = title
+
+    local subtitle = Instance.new("TextLabel")
+    subtitle.Name = "Subtitle"
+    subtitle.AnchorPoint = Vector2.new(0.5, 0.5)
+    subtitle.Position = UDim2.fromScale(0.5, 0.5)
+    subtitle.Size = UDim2.new(0, 600, 0, 24)
+    subtitle.BackgroundTransparency = 1
+    subtitle.Text = "Sailor Piece • by Luna"
+    subtitle.Font = Enum.Font.Gotham
+    subtitle.TextSize = 16
+    subtitle.TextColor3 = Color3.fromRGB(170, 150, 220)
+    subtitle.TextTransparency = 0
+    subtitle.Parent = bg
+
+    -- Прогресс-бар
+    local barBg = Instance.new("Frame")
+    barBg.Name = "BarBG"
+    barBg.AnchorPoint = Vector2.new(0.5, 0.5)
+    barBg.Position = UDim2.fromScale(0.5, 0.62)
+    barBg.Size = UDim2.new(0, 320, 0, 4)
+    barBg.BackgroundColor3 = Color3.fromRGB(40, 30, 60)
+    barBg.BorderSizePixel = 0
+    barBg.Parent = bg
+    local bbc = Instance.new("UICorner")
+    bbc.CornerRadius = UDim.new(1, 0)
+    bbc.Parent = barBg
+
+    local bar = Instance.new("Frame")
+    bar.Name = "Bar"
+    bar.AnchorPoint = Vector2.new(0, 0.5)
+    bar.Position = UDim2.new(0, 0, 0.5, 0)
+    bar.Size = UDim2.new(0, 0, 1, 0)
+    bar.BackgroundColor3 = Color3.fromRGB(170, 100, 250)
+    bar.BorderSizePixel = 0
+    bar.Parent = barBg
+    local bc = Instance.new("UICorner")
+    bc.CornerRadius = UDim.new(1, 0)
+    bc.Parent = bar
+
+    -- статус под прогресс-баром
+    local status = Instance.new("TextLabel")
+    status.AnchorPoint = Vector2.new(0.5, 0.5)
+    status.Position = UDim2.fromScale(0.5, 0.68)
+    status.Size = UDim2.new(0, 600, 0, 18)
+    status.BackgroundTransparency = 1
+    status.Text = "загрузка..."
+    status.Font = Enum.Font.Gotham
+    status.TextSize = 13
+    status.TextColor3 = Color3.fromRGB(140, 130, 180)
+    status.Parent = bg
+
+    -- Анимация: бар заполняется до 100% за 2 сек
+    task.spawn(function()
+        local TweenService = game:GetService("TweenService")
+        local ti = TweenInfo.new(2.0, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
+        pcall(function()
+            TweenService:Create(bar, ti, { Size = UDim2.new(1, 0, 1, 0) }):Play()
+        end)
+        pcall(function()
+            TweenService:Create(glow, TweenInfo.new(2.0, Enum.EasingStyle.Sine,
+                Enum.EasingDirection.InOut, -1, true),
+                { BackgroundTransparency = 0.7, Size = UDim2.fromScale(0.85, 0.85) }):Play()
+        end)
+    end)
+
+    -- Анимация статуса: меняющиеся точки + смена текста по этапам
+    task.spawn(function()
+        local stages = {
+            "проверка окружения",
+            "подгрузка модулей",
+            "инициализация UI",
+            "почти готово",
+        }
+        local i = 1
+        local dots = ""
+        while splashGui and i <= #stages do
+            for n = 1, 4 do
+                if not splashGui then return end
+                dots = string.rep(".", n - 1)
+                status.Text = stages[i] .. dots
+                task.wait(0.12)
+            end
+            i = i + 1
+        end
+    end)
+
+    _G.LunaSplashGui = splashGui   -- чтоб удалить если что-то пошло не так
+end
+
+local function destroySplash()
+    if not splashGui then return end
+    local g = splashGui
+    splashGui = nil
+    task.spawn(function()
+        local TweenService = game:GetService("TweenService")
+        local fadeInfo = TweenInfo.new(0.4, Enum.EasingStyle.Sine, Enum.EasingDirection.Out)
+        for _, d in ipairs(g:GetDescendants()) do
+            if d:IsA("Frame") then
+                pcall(function() TweenService:Create(d, fadeInfo, { BackgroundTransparency = 1 }):Play() end)
+            elseif d:IsA("TextLabel") then
+                pcall(function() TweenService:Create(d, fadeInfo, { TextTransparency = 1 }):Play() end)
+            elseif d:IsA("UIStroke") then
+                pcall(function() TweenService:Create(d, fadeInfo, { Transparency = 1 }):Play() end)
+            end
+        end
+        local bgFrame = g:FindFirstChild("BG")
+        if bgFrame then
+            pcall(function() TweenService:Create(bgFrame, fadeInfo, { BackgroundTransparency = 1 }):Play() end)
+        end
+        task.wait(0.45)
+        pcall(function() g:Destroy() end)
+        _G.LunaSplashGui = nil
+    end)
+end
+
 -- ===== окно Rayfield =====
 local Window = Rayfield:CreateWindow({
     Name = "Luna Hub | Sailor Piece",
     LoadingTitle = "Luna Hub",
     LoadingSubtitle = "загрузка модулей...",
-    Theme = "Amethyst",  -- глубокий тёмно-фиолетовый, читаемее на любом фоне
-    -- Не используем RightCtrl: старые Kavo-биндинги от предыдущих хабов на ней висят
-    -- даже после нашего reload-guard, и при нажатии плюются ошибкой "X is not a valid
-    -- member of CoreGui". K — реже коллидится. Можно переназначить через окно Rayfield.
-    ToggleUIKeybind = "K",
+    Theme = "Amethyst",  -- глубокий тёмно-фиолетовый
+    -- RightControl как и раньше + дублирующий UIS-хендлер ниже на случай,
+    -- если Rayfield'овский биндинг подвиснет (баг библиотеки: после повторного
+    -- toggle через Rayfield:SetVisibility() свой ToggleUIKeybind иногда лочится).
+    ToggleUIKeybind = "RightControl",
     DisableBuildWarnings = true,
+    -- ВАЖНО: автосохранение Rayfield-а сейчас ВЫКЛЮЧЕНО.
+    -- Если включить true — при следующем инжекте всё, что было включено
+    -- (Fly, NoClip, AutoFarm), сразу запустится. Это опасно.
+    -- Свой mini-конфиг — ниже, только для значений (слайдеры, выбор оружия,
+    -- скорость/гравитация и т.п.), без тогглов.
     ConfigurationSaving = {
-        Enabled = true,
+        Enabled = false,
         FolderName = "LunaHub",
         FileName = "sailor_piece_v3"
     },
@@ -263,30 +442,51 @@ local function spSelectSlot(slot)
 end
 
 -- Проверить что в руке есть Tool. Если нет — переключиться на sp_weaponSlot.
--- Возвращает текущий Tool в Character'е (или nil).
+-- Возвращает текущий "готовый к использованию" Tool в Character'е (или nil).
+-- "Готовый" = Tool находится В Character + у него есть Handle + Humanoid жив.
+-- Это критично для серверного VFXHandlers.Katana — он ходит к Tool.Handle и
+-- роняет :FindFirstChild("...") в nil, если Activate() пришёл слишком рано.
+local function _spToolReady(char)
+    if not char then return nil end
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.Health <= 0 then return nil end
+    local tool = char:FindFirstChildOfClass("Tool")
+    if not tool then return nil end
+    if tool.Parent ~= char then return nil end       -- Tool не экипирован
+    if not tool:FindFirstChild("Handle") then return nil end  -- Handle ещё не приехал с сервера
+    return tool
+end
+
+local _sp_lastEquip = 0
 local function spEnsureWeapon()
     local char = safeGetCharacter()
     if not char then return nil end
-    local tool = char:FindFirstChildOfClass("Tool")
+
+    local tool = _spToolReady(char)
     if tool then return tool end
 
     if not sp_autoEquip then return nil end
 
-    -- Сначала пробуем выбрать конкретный слот
+    -- Защита от пере-экипировки 10 раз в сек: не дёргаем чаще чем раз в 0.5с
+    local now = tick()
+    if now - _sp_lastEquip < 0.5 then return nil end
+    _sp_lastEquip = now
+
+    -- 1) пробуем выбрать слот через VIM
     spSelectSlot(sp_weaponSlot)
-    task.wait(0.15)
-    tool = char:FindFirstChildOfClass("Tool")
+    task.wait(0.35)   -- даём серверу время прицепить Handle
+    tool = _spToolReady(char)
     if tool then return tool end
 
-    -- Fallback: первый Tool в Backpack через Humanoid:EquipTool
+    -- 2) Fallback: первый Tool в Backpack через Humanoid:EquipTool
     local hum = safeGetHumanoid(char)
     local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
     if hum and backpack then
         local first = backpack:FindFirstChildOfClass("Tool")
         if first then
             pcall(function() hum:EquipTool(first) end)
-            task.wait(0.2)
-            tool = char:FindFirstChildOfClass("Tool")
+            task.wait(0.4)
+            tool = _spToolReady(char)
         end
     end
     return tool
@@ -417,20 +617,35 @@ end
 -- ====================================================
 -- Атака: VIM клики + клавиши
 -- ====================================================
+-- ВАЖНО: серверный ReplicatedStorage.AbilitySystem.VFXHandlers.Katana
+-- падает с "attempt to index nil with 'FindFirstChild'" если Activate-event
+-- пришёл до того как Tool.Handle прицепился к Character. Поэтому:
+--   1) Жёсткий троттлинг по sp_attackDelay
+--   2) Перед каждым кликом проверяем что Tool готов (см. _spToolReady)
+--   3) Если оружие нужно (Hand Fight off ИЛИ требуется Tool) и его нет — пропускаем кадр
 local _sp_lastClick = 0
 local function spMouseClick()
     if sp_handFightOff then return end
     if not VIM then return end
+
     local now = tick()
     if now - _sp_lastClick < sp_attackDelay then return end
-    _sp_lastClick = now
 
-    local tool = spEnsureWeapon()
-    if sp_useHandsOnly == false and not tool then
-        -- ничего в руках — но битьё руками включено, значит всё равно клик
-    elseif sp_useHandsOnly and not tool then
-        return   -- "только с оружием" и оружия нет — пропускаем клик
+    -- Проверка готовности оружия
+    local char = safeGetCharacter()
+    local toolReady = char and _spToolReady(char)
+    if not toolReady then
+        -- Только если режим "только с оружием" — пробуем экипировать.
+        -- Иначе бьём руками — это тоже валидный сценарий (Combat без тула).
+        if sp_useHandsOnly then
+            spEnsureWeapon()    -- может выйти, может нет — следующий кадр повторит
+            return              -- НЕ кликаем в этот кадр в любом случае
+        end
+        -- Hand-fight: если вообще нет персонажа — нет смысла кликать
+        if not char or not safeGetHumanoid(char) then return end
     end
+
+    _sp_lastClick = now
 
     pcall(function()
         VIM:SendMouseButtonEvent(0, 0, 0, true,  game, 1)
@@ -1565,6 +1780,86 @@ PlayerTab:CreateSlider({
     end
 })
 
+PlayerTab:CreateButton({
+    Name = "Сбросить скорость и прыжок в дефолт",
+    Callback = function()
+        local h = safeGetHumanoid(safeGetCharacter())
+        if h then
+            h.WalkSpeed = 16
+            h.JumpPower = 50
+        end
+        notify("Скорость и прыжок сброшены: 16 / 50")
+    end
+})
+
+-- ===== Speed Hack (мульти-двигатель: WalkSpeed * множитель) =====
+PlayerTab:CreateDivider()
+PlayerTab:CreateSection("Speed Hack")
+
+local speedHackEnabled = false
+local speedMultiplier  = 2.0
+local _speedConn       = nil
+local _speedBaseCache  = 16
+
+local function _stopSpeedHack()
+    if _speedConn then _speedConn:Disconnect(); _speedConn = nil end
+    -- Возвращаем базовую скорость (если игра не успела перебить)
+    local h = safeGetHumanoid(safeGetCharacter())
+    if h then h.WalkSpeed = _speedBaseCache end
+end
+
+local function _startSpeedHack()
+    _stopSpeedHack()
+    -- Кэшируем текущую WalkSpeed (что есть на момент включения) как "базу"
+    local h = safeGetHumanoid(safeGetCharacter())
+    _speedBaseCache = h and h.WalkSpeed or 16
+
+    _speedConn = RunService.Heartbeat:Connect(function()
+        if not speedHackEnabled then _stopSpeedHack(); return end
+        local hum = safeGetHumanoid(safeGetCharacter())
+        if hum then
+            local target = _speedBaseCache * speedMultiplier
+            -- Перезаписываем только если игра нас сбила
+            if math.abs(hum.WalkSpeed - target) > 0.5 then
+                hum.WalkSpeed = target
+            end
+        end
+    end)
+    track(_speedConn)
+end
+
+PlayerTab:CreateToggle({
+    Name = "Speed Hack (через WalkSpeed × множитель)",
+    CurrentValue = false,   -- ВАЖНО: всегда false при инжекте
+    Flag = nil,             -- НЕ сохраняем тогл в конфиг
+    Callback = function(v)
+        speedHackEnabled = v
+        if v then _startSpeedHack() else _stopSpeedHack() end
+    end
+})
+
+PlayerTab:CreateSlider({
+    Name = "Множитель скорости",
+    Range = { 1, 8 },
+    Increment = 0.1,
+    Suffix = "x",
+    CurrentValue = speedMultiplier,
+    Flag = "speedMul",   -- значение можно сохранять
+    Callback = function(v) speedMultiplier = v end
+})
+
+PlayerTab:CreateButton({
+    Name = "Сбросить SpeedHack",
+    Callback = function()
+        speedHackEnabled = false
+        speedMultiplier  = 2.0
+        _stopSpeedHack()
+        local h = safeGetHumanoid(safeGetCharacter())
+        if h then h.WalkSpeed = 16 end
+        notify("SpeedHack выключен, скорость = 16")
+    end
+})
+
 -- Anti-AFK
 local antiAfk = false
 PlayerTab:CreateToggle({
@@ -1628,6 +1923,29 @@ WorldTab:CreateSlider({
     Name = "Время суток", Range = { 0, 24 }, Increment = 1, Suffix = " ч",
     CurrentValue = 14, Flag = "tod",
     Callback = function(v) Lighting.ClockTime = v end
+})
+
+WorldTab:CreateButton({
+    Name = "Сбросить гравитацию (196.2)",
+    Callback = function()
+        workspace.Gravity = 196.2
+        notify("Гравитация: 196.2 (дефолт Roblox)")
+    end
+})
+
+WorldTab:CreateButton({
+    Name = "Сбросить мир в дефолт",
+    Callback = function()
+        workspace.Gravity = 196.2
+        Lighting.ClockTime = 14
+        Lighting.FogEnd = 1000
+        Lighting.FogStart = 0
+        Lighting.SkyboxEnabled = true
+        Lighting.Brightness = 3
+        Lighting.Ambient = Color3.new(0.5, 0.5, 0.5)
+        Lighting.OutdoorAmbient = Color3.new(0.5, 0.5, 0.5)
+        notify("Все настройки мира сброшены")
+    end
 })
 
 
@@ -1994,14 +2312,109 @@ end
 
 SettingsTab:CreateSection("Окно")
 SettingsTab:CreateButton({
-    Name = "Скрыть/показать меню (или жми K)",
+    Name = "Скрыть/показать меню (или жми RightCtrl)",
     Callback = function() Rayfield:SetVisibility(not Rayfield:IsVisible()) end
 })
 
-SettingsTab:CreateParagraph({
-    Title = "Конфиг",
-    Content = "Все слайдеры и тогглы сохраняются автоматически в LunaHub/sailor_piece_v3 (включая выбор слота оружия, скиллы, тумблеры God Mode, FOV аимбота, частоту ESP)."
+-- ====================================================
+-- Свой мини-конфиг (только значения, без тогглов!)
+-- ====================================================
+-- Сохраняем: задержки, дальности, длительности, слот оружия, скиллы (Z/X/C/V/F),
+-- множитель скорости, FOV/плавность аимбота, цвет/дальность ESP, частота ESP.
+-- НЕ сохраняем: Auto Farm, Boss Farm, God Mode, Fly, NoClip, ESP Master, Aimbot —
+-- любой "включатель" остаётся OFF при каждом инжекте, чтобы не было сюрпризов.
+SettingsTab:CreateDivider()
+SettingsTab:CreateSection("Конфиг (только значения)")
+
+local LUNA_CONFIG_PATH = "LunaHub_SailorPiece.json"
+local function _serializeSettings()
+    return {
+        sp_scanRadius   = sp_scanRadius,
+        sp_searchRadius = sp_searchRadius,
+        sp_huntDuration = sp_huntDuration,
+        sp_hoverHeight  = sp_hoverHeight,
+        sp_attackDelay  = sp_attackDelay,
+        sp_skillDelay   = sp_skillDelay,
+        sp_skillHold    = sp_skillHold,
+        sp_weaponSlot   = sp_weaponSlot,
+        sp_useZ = sp_useZ, sp_useX = sp_useX, sp_useC = sp_useC,
+        sp_useV = sp_useV, sp_useF = sp_useF,
+        speedMultiplier = speedMultiplier,
+        aimbotFov       = aimbotFov,
+        aimbotSmooth    = aimbotSmooth,
+        renderDistance  = renderDistance,
+        espMinInterval  = espMinInterval,
+    }
+end
+
+local function _applySettings(t)
+    if type(t) ~= "table" then return end
+    sp_scanRadius   = t.sp_scanRadius   or sp_scanRadius
+    sp_searchRadius = t.sp_searchRadius or sp_searchRadius
+    sp_huntDuration = t.sp_huntDuration or sp_huntDuration
+    sp_hoverHeight  = t.sp_hoverHeight  or sp_hoverHeight
+    sp_attackDelay  = t.sp_attackDelay  or sp_attackDelay
+    sp_skillDelay   = t.sp_skillDelay   or sp_skillDelay
+    sp_skillHold    = t.sp_skillHold    or sp_skillHold
+    sp_weaponSlot   = t.sp_weaponSlot   or sp_weaponSlot
+    if t.sp_useZ ~= nil then sp_useZ = t.sp_useZ end
+    if t.sp_useX ~= nil then sp_useX = t.sp_useX end
+    if t.sp_useC ~= nil then sp_useC = t.sp_useC end
+    if t.sp_useV ~= nil then sp_useV = t.sp_useV end
+    if t.sp_useF ~= nil then sp_useF = t.sp_useF end
+    speedMultiplier = t.speedMultiplier or speedMultiplier
+    aimbotFov       = t.aimbotFov       or aimbotFov
+    aimbotSmooth    = t.aimbotSmooth    or aimbotSmooth
+    renderDistance  = t.renderDistance  or renderDistance
+    espMinInterval  = t.espMinInterval  or espMinInterval
+end
+
+SettingsTab:CreateButton({
+    Name = "Сохранить значения вручную",
+    Callback = function()
+        if not (writefile and HttpService) then
+            notify("Executor не поддерживает запись файлов")
+            return
+        end
+        local ok, json = pcall(function()
+            return HttpService:JSONEncode(_serializeSettings())
+        end)
+        if not ok then notify("JSON encode error"); return end
+        local ok2, err = pcall(function() writefile(LUNA_CONFIG_PATH, json) end)
+        if ok2 then notify("Конфиг сохранён в " .. LUNA_CONFIG_PATH)
+        else notify("Не удалось записать: " .. tostring(err)) end
+    end
 })
+
+SettingsTab:CreateButton({
+    Name = "Загрузить сохранённые значения",
+    Callback = function()
+        if not (readfile and isfile and HttpService) then
+            notify("Executor не поддерживает чтение файлов")
+            return
+        end
+        if not isfile(LUNA_CONFIG_PATH) then
+            notify("Файл конфига не найден: " .. LUNA_CONFIG_PATH)
+            return
+        end
+        local ok, raw = pcall(readfile, LUNA_CONFIG_PATH)
+        if not ok then notify("Не удалось прочитать"); return end
+        local ok2, t = pcall(function() return HttpService:JSONDecode(raw) end)
+        if ok2 and type(t) == "table" then
+            _applySettings(t)
+            notify("Значения загружены — обнови UI слайдерами вручную")
+        else
+            notify("JSON-декод не удался")
+        end
+    end
+})
+
+SettingsTab:CreateParagraph({
+    Title = "Про конфиг",
+    Content = "Здесь сохраняются ТОЛЬКО ЗНАЧЕНИЯ слайдеров (задержки, скорости, FOV, слот оружия, тогглы скиллов Z/X/C/V/F). Любые «включатели» (Авто-фарм, Fly, NoClip, God Mode и т.п.) при каждом запуске остаются ВЫКЛЮЧЕНЫ — чтобы скрипт не запускал автофарм при заходе. Если хочешь восстановить значения — жми «Загрузить» после инжекта."
+})
+
+SettingsTab:CreateDivider()
 
 SettingsTab:CreateButton({
     Name = "Полностью выгрузить скрипт",
@@ -2036,6 +2449,7 @@ _G.LunaUnload = function()
     for plr in pairs(ESP) do pcall(clearESP, plr) end
 
     pcall(function() if tracerGui then tracerGui:Destroy() end end)
+    pcall(destroySplash)
     pcall(function() Rayfield:Destroy() end)
 
     _G.LunaWindowGui = nil
@@ -2043,9 +2457,33 @@ _G.LunaUnload = function()
     print("[Luna] unload done")
 end
 
--- Запуск автосохранения конфига Rayfield (если включено)
-pcall(function() if Rayfield.LoadConfiguration then Rayfield:LoadConfiguration() end end)
+-- Rayfield:LoadConfiguration() убран:
+-- ConfigurationSaving = { Enabled = false }, поэтому грузить нечего.
+-- Свой mini-конфиг (только значения) грузится только по нажатию кнопки в Settings.
 
-notify("Luna Hub загружен. Жми K — открыть/закрыть меню", 4)
+-- ====================================================
+-- Страховочный UIS-хендлер для toggle UI (RightControl)
+-- ====================================================
+-- Rayfield-овский ToggleUIKeybind иногда залипает после
+-- ручного :SetVisibility(). Поэтому держим запасной слушатель — он всегда
+-- работает напрямую через UserInputService.
+do
+    local debounce = 0
+    track(UIS.InputBegan:Connect(function(input, gameProcessed)
+        if gameProcessed then return end
+        if input.KeyCode ~= Enum.KeyCode.RightControl then return end
+        local now = tick()
+        if now - debounce < 0.15 then return end
+        debounce = now
+        pcall(function()
+            Rayfield:SetVisibility(not Rayfield:IsVisible())
+        end)
+    end))
+end
+
+-- Убираем splash через 2 сек (или сразу если уже всё готово)
+task.delay(2.0, function() pcall(destroySplash) end)
+
+notify("Luna Hub загружен. RightCtrl — открыть/закрыть меню", 4)
 print("[Luna] ready | game: " .. game.Name)
 _G.LunaCheatLoaded = true
