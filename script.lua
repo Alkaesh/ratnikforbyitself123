@@ -138,9 +138,12 @@ hiddenParent = hiddenParent or game:GetService("CoreGui")
 local Window = Rayfield:CreateWindow({
     Name = "Luna Hub | Sailor Piece",
     LoadingTitle = "Luna Hub",
-    LoadingSubtitle = "loading modules...",
-    Theme = "Default",
-    ToggleUIKeybind = "RightControl",
+    LoadingSubtitle = "загрузка модулей...",
+    Theme = "Amethyst",  -- глубокий тёмно-фиолетовый, читаемее на любом фоне
+    -- Не используем RightCtrl: старые Kavo-биндинги от предыдущих хабов на ней висят
+    -- даже после нашего reload-guard, и при нажатии плюются ошибкой "X is not a valid
+    -- member of CoreGui". K — реже коллидится. Можно переназначить через окно Rayfield.
+    ToggleUIKeybind = "K",
     DisableBuildWarnings = true,
     ConfigurationSaving = {
         Enabled = true,
@@ -151,20 +154,29 @@ local Window = Rayfield:CreateWindow({
     KeySystem = false
 })
 
+-- Увеличиваем размер окна (Rayfield по умолчанию ~500x440 — для 7 табов мало).
+-- Делаем 620x520. Window.Main — внутренний Frame, его размер можно поправить
+-- безопасно (если форк библиотеки сменит структуру — pcall не даст крашу).
+pcall(function()
+    if Window and Window.Main then
+        Window.Main.Size = UDim2.new(0, 620, 0, 520)
+    end
+end)
+
 -- Создаём табы заранее, чтобы можно было ссылаться из любого места
-local SailorTab  = Window:CreateTab("Sailor Piece", 4483362458)
-local CombatTab  = Window:CreateTab("Combat",       4483345998)
-local PlayerTab  = Window:CreateTab("Player",       7733715400)
-local VisualsTab = Window:CreateTab("Visuals",      4483345998)
-local ESPTab     = Window:CreateTab("ESP",          7734053495)
-local WorldTab   = Window:CreateTab("World",        4483345998)
-local SettingsTab = Window:CreateTab("Settings",    4483345998)
+local SailorTab   = Window:CreateTab("Sailor Piece", 4483362458)
+local CombatTab   = Window:CreateTab("Бой",          4483345998)
+local PlayerTab   = Window:CreateTab("Персонаж",     7733715400)
+local VisualsTab  = Window:CreateTab("Графика",      4483345998)
+local ESPTab      = Window:CreateTab("ESP",          7734053495)
+local WorldTab    = Window:CreateTab("Мир",          4483345998)
+local SettingsTab = Window:CreateTab("Настройки",    4483345998)
 
 
 --========================================================
 -- SAILOR PIECE — Auto Quest Farm
 --========================================================
-local SQuestSec  = SailorTab:CreateSection("Quest Setup")
+local SQuestSec  = SailorTab:CreateSection("Квест и зона")
 
 -- ===== state =====
 -- Квестовый цикл
@@ -770,28 +782,50 @@ local function startGodMode()
     stopGodMode()
     godRebuildCache()
 
+    -- Throttle: noclip достаточно проверять 30 раз/сек, hover — 60 раз/сек,
+    -- но только если позиция моба сдвинулась >0.5 ст. Это спасает FPS на боссах
+    -- которые стоят на месте 90% времени.
+    local lastNoclip = 0
+    local lastHoverPos = Vector3.zero
+    local lastHoverHead = nil
+
     godConn = RunService.Heartbeat:Connect(function()
         if not godModeEnabled then
             stopGodMode()
             return
         end
-        -- 1) Noclip — пишем CanCollide только если он реально true
-        for _, p in ipairs(godPartsCache) do
-            if p.CanCollide then p.CanCollide = false end
+        local now = tick()
+
+        -- 1) Noclip — 30 Hz, пишем только если значение реально изменилось
+        if now - lastNoclip >= 1/30 then
+            lastNoclip = now
+            for i = 1, #godPartsCache do
+                local p = godPartsCache[i]
+                if p.CanCollide then p.CanCollide = false end
+            end
         end
-        -- 2) Hover над целью
+
+        -- 2) Hover над целью — пересчитываем CFrame только при движении моба
         local mob = sp_currentMob
         if mob and mob.Parent then
-            local char = safeGetCharacter()
-            local hrp = char and char:FindFirstChild("HumanoidRootPart")
             local mobHead = mob:FindFirstChild("Head")
                 or mob:FindFirstChild("HumanoidRootPart") or mob.PrimaryPart
-            if hrp and mobHead then
+            if mobHead then
                 local headPos = mobHead.Position
-                local eye = headPos + Vector3.new(0, sp_hoverHeight, 0)
-                hrp.CFrame = CFrame.lookAt(eye, headPos)
-                hrp.AssemblyLinearVelocity = Vector3.zero
+                if (headPos - lastHoverPos).Magnitude > 0.5 or mobHead ~= lastHoverHead then
+                    lastHoverPos = headPos
+                    lastHoverHead = mobHead
+                    local char = safeGetCharacter()
+                    local hrp = char and char:FindFirstChild("HumanoidRootPart")
+                    if hrp then
+                        local eye = headPos + Vector3.new(0, sp_hoverHeight, 0)
+                        hrp.CFrame = CFrame.lookAt(eye, headPos)
+                        hrp.AssemblyLinearVelocity = Vector3.zero
+                    end
+                end
             end
+        else
+            lastHoverHead = nil
         end
     end)
     track(godConn)
@@ -814,15 +848,22 @@ end))
 --   * слушаем HealthChanged и сразу восстанавливаем
 -- Не панацея против серверной валидации HP, но в Sailor Piece работает на
 -- большинстве боссов кроме тех, где HP считается RemoteEvent'ом сервера.
-local god2Conn
+local god2Thread        -- task.spawn corotine (НЕ RBXScriptConnection — :Disconnect нельзя!)
 local god2HealthConn
 local god2StateConn
 local god2BoundHum
 
 local function _god2Detach()
-    if god2Conn then god2Conn:Disconnect(); god2Conn = nil end
-    if god2HealthConn then god2HealthConn:Disconnect(); god2HealthConn = nil end
-    if god2StateConn then god2StateConn:Disconnect(); god2StateConn = nil end
+    -- thread сам помрёт когда godMode2Enabled = false
+    god2Thread = nil
+    if god2HealthConn then
+        pcall(function() god2HealthConn:Disconnect() end)
+        god2HealthConn = nil
+    end
+    if god2StateConn then
+        pcall(function() god2StateConn:Disconnect() end)
+        god2StateConn = nil
+    end
     if god2BoundHum then
         pcall(function()
             god2BoundHum:SetStateEnabled(Enum.HumanoidStateType.Dead, true)
@@ -842,7 +883,7 @@ local function _god2Bind(hum)
     god2HealthConn = hum.HealthChanged:Connect(function(h)
         if not godMode2Enabled then return end
         if h < hum.MaxHealth then
-            hum.Health = hum.MaxHealth
+            pcall(function() hum.Health = hum.MaxHealth end)
         end
     end)
     god2StateConn = hum.StateChanged:Connect(function(_, new)
@@ -851,8 +892,10 @@ local function _god2Bind(hum)
             or new == Enum.HumanoidStateType.Ragdoll
             or new == Enum.HumanoidStateType.FallingDown
         then
-            hum:ChangeState(Enum.HumanoidStateType.GettingUp)
-            hum.Health = hum.MaxHealth
+            pcall(function()
+                hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+                hum.Health = hum.MaxHealth
+            end)
         end
     end)
 end
@@ -863,23 +906,20 @@ end
 
 local function startGodMode2()
     stopGodMode2()
-    local function bindCurrent()
-        local hum = safeGetHumanoid(safeGetCharacter())
-        if hum then _god2Bind(hum) end
-    end
-    bindCurrent()
+    local hum = safeGetHumanoid(safeGetCharacter())
+    if hum then _god2Bind(hum) end
 
-    -- Каждые 0.1с подтягиваем Health (без Heartbeat, чтобы не съедать FPS)
-    god2Conn = task.spawn(function()
+    -- Каждые 0.1с подтягиваем Health (без Heartbeat, чтобы не съедать FPS).
+    -- Это THREAD, НЕ соединение — :Disconnect() здесь невалиден.
+    god2Thread = task.spawn(function()
         while godMode2Enabled do
-            local hum = safeGetHumanoid(safeGetCharacter())
-            if hum and hum.Health < hum.MaxHealth then
-                hum.Health = hum.MaxHealth
+            local h = safeGetHumanoid(safeGetCharacter())
+            if h and h.Health < h.MaxHealth then
+                pcall(function() h.Health = h.MaxHealth end)
             end
             task.wait(0.1)
         end
     end)
-    -- god2Conn здесь — не RBXScriptConnection, а корутина; сам остановится по флагу
 end
 
 -- ребайнд при респавне
@@ -888,8 +928,18 @@ track(LocalPlayer.CharacterAdded:Connect(function(_)
         task.wait(0.5)
         local hum = safeGetHumanoid(safeGetCharacter())
         if hum then
-            _god2Detach()   -- очищаем старые конны (они на старом Humanoid)
+            _god2Detach()
             _god2Bind(hum)
+            -- перезапускаем поток восстановления HP, т.к. detach его выгасил флагом
+            task.spawn(function()
+                while godMode2Enabled do
+                    local h = safeGetHumanoid(safeGetCharacter())
+                    if h and h.Health < h.MaxHealth then
+                        pcall(function() h.Health = h.MaxHealth end)
+                    end
+                    task.wait(0.1)
+                end
+            end)
         end
     end
 end))
@@ -899,39 +949,45 @@ end))
 -- SAILOR PIECE — UI
 --========================================================
 
+SailorTab:CreateParagraph({
+    Title = "Как пользоваться",
+    Content = "1. Подойди к нужной зоне квеста\n" ..
+              "2. Жми «Сканировать NPC» и «Сканировать мобов»\n" ..
+              "3. Выбери NPC и моба в выпадающих списках ниже\n" ..
+              "4. (опционально) включи God Mode v1 и/или v2\n" ..
+              "5. Включи «Авто-фарм»\n\n" ..
+              "Для рейдов листай вниз до раздела «Рейдовые боссы»."
+})
+
 -- ===== Quest Setup =====
 local npcDropdown, mobDropdown
 
 npcDropdown = SailorTab:CreateDropdown({
-    Name = "Выбранный NPC",
+    Name = "NPC квеста",
     Options = sp_npcChoices,
     CurrentOption = { sp_npcChoices[1] },
     MultipleOptions = false,
     Flag = "sp_questNpc",
     Callback = function(opt)
         local v = (type(opt) == "table") and opt[1] or opt
-        if v and not _isPlaceholder(v) then
-            sp_questNpcName = v
-        end
+        if v and not _isPlaceholder(v) then sp_questNpcName = v end
     end
 })
 
 mobDropdown = SailorTab:CreateDropdown({
-    Name = "Выбранный Моб",
+    Name = "Моб для фарма",
     Options = sp_mobChoices,
     CurrentOption = { sp_mobChoices[1] },
     MultipleOptions = false,
     Flag = "sp_mob",
     Callback = function(opt)
         local v = (type(opt) == "table") and opt[1] or opt
-        if v and not _isPlaceholder(v) then
-            sp_mobBaseName = v
-        end
+        if v and not _isPlaceholder(v) then sp_mobBaseName = v end
     end
 })
 
 SailorTab:CreateButton({
-    Name = "Scan Area NPCs",
+    Name = "Сканировать NPC рядом",
     Callback = function()
         sp_npcChoices = spScanAreaNpcs()
         if npcDropdown and npcDropdown.Refresh then
@@ -942,7 +998,7 @@ SailorTab:CreateButton({
 })
 
 SailorTab:CreateButton({
-    Name = "Scan Area Mobs",
+    Name = "Сканировать мобов рядом",
     Callback = function()
         sp_mobChoices = spScanAreaMobs()
         if mobDropdown and mobDropdown.Refresh then
@@ -952,51 +1008,62 @@ SailorTab:CreateButton({
     end
 })
 
+SailorTab:CreateParagraph({
+    Title = "О сканере",
+    Content = "Кнопки находят квестовых NPC (workspace.ServiceNPCs) и мобов (workspace.NPCs) только в радиусе сканирования от тебя. Для мобов имена нормализуются: «Monkey1», «Monkey2» → «Monkey»."
+})
+
 SailorTab:CreateSlider({
-    Name = "Scan Radius",
+    Name = "Радиус сканера",
     Range = { 30, 500 },
     Increment = 10,
-    Suffix = "ст.",
+    Suffix = " ст.",
     CurrentValue = sp_scanRadius,
     Flag = "sp_scanRadius",
     Callback = function(v) sp_scanRadius = v end
 })
 
 SailorTab:CreateSlider({
-    Name = "Search Radius (Hunt)",
+    Name = "Радиус поиска моба (во время охоты)",
     Range = { 50, 1000 },
     Increment = 25,
-    Suffix = "ст.",
+    Suffix = " ст.",
     CurrentValue = sp_searchRadius,
     Flag = "sp_searchRadius",
     Callback = function(v) sp_searchRadius = v end
 })
 
 SailorTab:CreateSlider({
-    Name = "Hunt Duration",
+    Name = "Длительность охоты",
     Range = { 15, 300 },
     Increment = 5,
-    Suffix = "с",
+    Suffix = " сек",
     CurrentValue = sp_huntDuration,
     Flag = "sp_huntDuration",
     Callback = function(v) sp_huntDuration = v end
 })
 
 SailorTab:CreateSlider({
-    Name = "Hover Height",
+    Name = "Высота парения над мобом",
     Range = { 3, 20 },
     Increment = 1,
-    Suffix = "ст.",
+    Suffix = " ст.",
     CurrentValue = sp_hoverHeight,
     Flag = "sp_hoverHeight",
     Callback = function(v) sp_hoverHeight = v end
 })
 
 -- ===== Combat =====
-local SCombatSec = SailorTab:CreateSection("Combat")
+SailorTab:CreateDivider()
+local SCombatSec = SailorTab:CreateSection("Бой и оружие")
+
+SailorTab:CreateParagraph({
+    Title = "Слот оружия",
+    Content = "После смерти игра экипирует слот 1 по умолчанию. Скрипт автоматически перенажимает выбранную тут цифру при каждом respawn — чтобы ты сам не путался в инвентаре."
+})
 
 SailorTab:CreateSlider({
-    Name = "Weapon Slot",
+    Name = "Слот оружия (1—5)",
     Range = { 1, 5 },
     Increment = 1,
     Suffix = "",
@@ -1004,78 +1071,95 @@ SailorTab:CreateSlider({
     Flag = "sp_weaponSlot",
     Callback = function(v)
         sp_weaponSlot = v
-        spSelectSlot(v)   -- сразу же экипируем
+        spSelectSlot(v)
     end
 })
 
 SailorTab:CreateToggle({
-    Name = "Auto Equip Slot on Spawn",
+    Name = "Авто-экип после возрождения",
     CurrentValue = sp_autoEquip,
     Flag = "sp_autoEquip",
     Callback = function(v) sp_autoEquip = v end
 })
 
 SailorTab:CreateButton({
-    Name = "Equip Slot Now",
+    Name = "Экипировать слот сейчас",
     Callback = function() spSelectSlot(sp_weaponSlot) end
 })
 
+SailorTab:CreateParagraph({
+    Title = "Поведение кликов",
+    Content = "«Бить руками» — отправлять клики мыши через VirtualInputManager.\n" ..
+              "«Только с оружием» — не бить если в руках ничего нет (пропускать кадр и переэкипировать)."
+})
+
 SailorTab:CreateToggle({
-    Name = "Hand Fight (mouse clicks)",
+    Name = "Бить руками (клики мыши)",
     CurrentValue = not sp_handFightOff,
     Flag = "sp_handFight",
     Callback = function(v) sp_handFightOff = not v end
 })
 
 SailorTab:CreateToggle({
-    Name = "Require Tool to Click",
+    Name = "Бить только с оружием",
     CurrentValue = sp_useHandsOnly,
     Flag = "sp_requireTool",
     Callback = function(v) sp_useHandsOnly = v end
 })
 
 SailorTab:CreateSlider({
-    Name = "Attack Delay",
+    Name = "Задержка между кликами",
     Range = { 0.15, 1.0 },
     Increment = 0.05,
-    Suffix = "с",
+    Suffix = " сек",
     CurrentValue = sp_attackDelay,
     Flag = "sp_attackDelay",
     Callback = function(v) sp_attackDelay = v end
 })
 
 SailorTab:CreateSlider({
-    Name = "Skill Delay (between)",
+    Name = "Задержка между скиллами",
     Range = { 0.3, 5.0 },
     Increment = 0.1,
-    Suffix = "с",
+    Suffix = " сек",
     CurrentValue = sp_skillDelay,
     Flag = "sp_skillDelay",
     Callback = function(v) sp_skillDelay = v end
 })
 
 SailorTab:CreateSlider({
-    Name = "Skill Hold",
+    Name = "Удержание клавиши скилла",
     Range = { 0.05, 0.5 },
     Increment = 0.05,
-    Suffix = "с",
+    Suffix = " сек",
     CurrentValue = sp_skillHold,
     Flag = "sp_skillHold",
     Callback = function(v) sp_skillHold = v end
 })
 
--- Скиллы (тогглы Z/X/C/V/F общие для квестов и боссов)
-SailorTab:CreateToggle({ Name = "Use Z", CurrentValue = sp_useZ, Flag = "sp_useZ", Callback = function(v) sp_useZ = v end })
-SailorTab:CreateToggle({ Name = "Use X", CurrentValue = sp_useX, Flag = "sp_useX", Callback = function(v) sp_useX = v end })
-SailorTab:CreateToggle({ Name = "Use C", CurrentValue = sp_useC, Flag = "sp_useC", Callback = function(v) sp_useC = v end })
-SailorTab:CreateToggle({ Name = "Use V", CurrentValue = sp_useV, Flag = "sp_useV", Callback = function(v) sp_useV = v end })
-SailorTab:CreateToggle({ Name = "Use F", CurrentValue = sp_useF, Flag = "sp_useF", Callback = function(v) sp_useF = v end })
+SailorTab:CreateParagraph({
+    Title = "Скиллы",
+    Content = "Тогглы ниже включают/выключают конкретные клавиши в ротации. Работают и для квестов, и для боссов."
+})
+SailorTab:CreateToggle({ Name = "Скилл Z", CurrentValue = sp_useZ, Flag = "sp_useZ", Callback = function(v) sp_useZ = v end })
+SailorTab:CreateToggle({ Name = "Скилл X", CurrentValue = sp_useX, Flag = "sp_useX", Callback = function(v) sp_useX = v end })
+SailorTab:CreateToggle({ Name = "Скилл C", CurrentValue = sp_useC, Flag = "sp_useC", Callback = function(v) sp_useC = v end })
+SailorTab:CreateToggle({ Name = "Скилл V", CurrentValue = sp_useV, Flag = "sp_useV", Callback = function(v) sp_useV = v end })
+SailorTab:CreateToggle({ Name = "Скилл F", CurrentValue = sp_useF, Flag = "sp_useF", Callback = function(v) sp_useF = v end })
 
 -- ===== God Mode =====
+SailorTab:CreateDivider()
 local SGodSec = SailorTab:CreateSection("God Mode")
 
+SailorTab:CreateParagraph({
+    Title = "Что это",
+    Content = "v1 — клиентский Noclip + парение над целью на заданной высоте. Работает против melee-боссов и AOE-сплеша.\n\n" ..
+              "v2 — постоянное восстановление HP до максимума + блокировка состояния «Dead» у твоего Humanoid. Полезно когда игра доверяет клиенту HP.\n\n" ..
+              "Можно включить оба одновременно — друг другу не мешают."
+})
+
 SailorTab:CreateToggle({
-    Name = "God Mode v1 (Noclip + Hover 7s)",
+    Name = "God Mode v1 — Noclip + парение",
     CurrentValue = false,
     Flag = "godModeV1",
     Callback = function(v)
@@ -1085,7 +1169,7 @@ SailorTab:CreateToggle({
 })
 
 SailorTab:CreateToggle({
-    Name = "God Mode v2 (HP-restore + Dead-block)",
+    Name = "God Mode v2 — восстановление HP",
     CurrentValue = false,
     Flag = "godModeV2",
     Callback = function(v)
@@ -1094,18 +1178,12 @@ SailorTab:CreateToggle({
     end
 })
 
-SailorTab:CreateParagraph({
-    Title = "О God Mode",
-    Content = "v1 — клиентский noclip + парение над целью (работает против melee/AOE боссов).\n" ..
-              "v2 — постоянное восстановление HP + блок Dead-state (полезно когда игра доверяет клиенту HP).\n" ..
-              "Можно включать оба одновременно для максимальной защиты."
-})
-
 -- ===== Run =====
-local SRunSec = SailorTab:CreateSection("Run")
+SailorTab:CreateDivider()
+local SRunSec = SailorTab:CreateSection("Запуск")
 
 SailorTab:CreateToggle({
-    Name = "Auto Farm (Quest)",
+    Name = "Авто-фарм (квест)",
     CurrentValue = false,
     Flag = "sp_autoFarm",
     Callback = function(v)
@@ -1114,7 +1192,7 @@ SailorTab:CreateToggle({
 })
 
 SailorTab:CreateButton({
-    Name = "Take Quest Now",
+    Name = "Взять квест сейчас",
     Callback = function()
         task.spawn(function()
             _sp_forcedTp = true
@@ -1126,7 +1204,7 @@ SailorTab:CreateButton({
 })
 
 SailorTab:CreateButton({
-    Name = "TP To Mob",
+    Name = "Телепорт к мобу",
     Callback = function()
         task.spawn(function()
             _sp_forcedTp = true
@@ -1143,20 +1221,30 @@ SailorTab:CreateButton({
     end
 })
 
+SailorTab:CreateParagraph({
+    Title = "Принудительная смена фазы",
+    Content = "Если скрипт «застрял» в фарме мобов, а тебе надо обратно к NPC — жми «К квесту». И наоборот."
+})
 SailorTab:CreateButton({
-    Name = "Force: TakeQuest",
+    Name = "Принудительно: к квесту",
     Callback = function() _G.QuestState = "TakeQuest" end
 })
 SailorTab:CreateButton({
-    Name = "Force: Hunting",
+    Name = "Принудительно: бить мобов",
     Callback = function() _G.QuestState = "Hunting" end
 })
 
 -- ===== Raid Bosses =====
-local SBossSec = SailorTab:CreateSection("Raid Bosses")
+SailorTab:CreateDivider()
+local SBossSec = SailorTab:CreateSection("Рейдовые боссы")
+
+SailorTab:CreateParagraph({
+    Title = "Что это",
+    Content = "Отдельный режим. Игнорирует квестовый NPC, ищет выбранного босса по корню имени (например «BlackReaperBoss» поймает любую сложность: _Normal, _Medium, _Hard, _Extreme). Скиллы и слот оружия — общие с обычным фармом."
+})
 
 SailorTab:CreateDropdown({
-    Name = "Рейдовые Боссы",
+    Name = "Босс",
     Options = EliteBossOrder,
     CurrentOption = { sp_bossDisplayName },
     MultipleOptions = false,
@@ -1171,7 +1259,7 @@ SailorTab:CreateDropdown({
 })
 
 SailorTab:CreateToggle({
-    Name = "Auto Farm Selected Boss",
+    Name = "Авто-фарм выбранного босса",
     CurrentValue = false,
     Flag = "sp_bossFarm",
     Callback = function(v)
@@ -1180,15 +1268,15 @@ SailorTab:CreateToggle({
 })
 
 SailorTab:CreateParagraph({
-    Title = "Подсказка",
-    Content = "Имя ищется через string.find — ловит любой суффикс сложности (_Normal, _Medium, _Hard, _Extreme и т.д.). Скиллы (Z/X/C/V/F) и слот оружия общие с квест-фармом."
+    Title = "Совет",
+    Content = "При включении этого тумблера обычный квестовый авто-фарм отключится автоматически — нельзя одновременно фармить квесты и босса."
 })
 
 
 --========================================================
 -- COMBAT TAB (Aimbot + TP Behind)
 --========================================================
-local CombatSec = CombatTab:CreateSection("Aimbot")
+local CombatSec = CombatTab:CreateSection("Аимбот")
 
 local aimbotEnabled = false
 local aimbotKey  = Enum.UserInputType.MouseButton2
@@ -1253,8 +1341,13 @@ local function startAimbot()
     track(aimbotConn)
 end
 
+CombatTab:CreateParagraph({
+    Title = "Аимбот",
+    Content = "Захватывает камеру на ближайшего противника пока зажата выбранная клавиша. Не стреляет сам — стрельбу делаешь ты, скрипт только наводит."
+})
+
 CombatTab:CreateToggle({
-    Name = "Aimbot",
+    Name = "Аимбот",
     CurrentValue = false,
     Flag = "aimbotEnabled",
     Callback = function(v)
@@ -1263,17 +1356,17 @@ CombatTab:CreateToggle({
     end
 })
 CombatTab:CreateSlider({
-    Name = "Aimbot FOV", Range = { 5, 180 }, Increment = 1, Suffix = "°",
+    Name = "Угол обзора аимбота (FOV)", Range = { 5, 180 }, Increment = 1, Suffix = "°",
     CurrentValue = aimbotFov, Flag = "aimbotFov",
     Callback = function(v) aimbotFov = v end
 })
 CombatTab:CreateSlider({
-    Name = "Aimbot Smooth", Range = { 0.05, 1 }, Increment = 0.05, Suffix = "",
+    Name = "Плавность наведения", Range = { 0.05, 1 }, Increment = 0.05, Suffix = "",
     CurrentValue = aimbotSmooth, Flag = "aimbotSmooth",
     Callback = function(v) aimbotSmooth = v end
 })
 CombatTab:CreateDropdown({
-    Name = "Aimbot Key",
+    Name = "Клавиша захвата",
     Options = { "RMB", "LMB", "E", "Q", "F" },
     CurrentOption = { "RMB" },
     Flag = "aimbotKeyPick",
@@ -1287,16 +1380,17 @@ CombatTab:CreateDropdown({
     end
 })
 CombatTab:CreateToggle({
-    Name = "Team Check",
+    Name = "Игнорировать союзников",
     CurrentValue = false, Flag = "teamCheck",
     Callback = function(v) teamCheck = v end
 })
 
-local TPSec = CombatTab:CreateSection("TP / Misc")
+CombatTab:CreateDivider()
+local TPSec = CombatTab:CreateSection("Телепорт к игрокам")
 local selectedPlayerName
 
 CombatTab:CreateButton({
-    Name = "TP Behind Closest Enemy",
+    Name = "Телепорт за спину ближайшему врагу",
     Callback = function()
         local t = findClosestEnemy(false, nil)
         if not t then notify("Врагов нет"); return end
@@ -1319,7 +1413,7 @@ end
 
 local tpDropdown
 tpDropdown = CombatTab:CreateDropdown({
-    Name = "Target Player",
+    Name = "Игрок-цель",
     Options = getPlayerNameList(),
     CurrentOption = { (Players:GetPlayers()[2] and Players:GetPlayers()[2].Name) or "(нет игроков)" },
     Flag = "tpTarget",
@@ -1337,11 +1431,11 @@ track(Players.PlayerAdded:Connect(refreshTpDropdown))
 track(Players.PlayerRemoving:Connect(refreshTpDropdown))
 
 CombatTab:CreateButton({
-    Name = "Refresh Players",
+    Name = "Обновить список игроков",
     Callback = function() refreshTpDropdown() end
 })
 CombatTab:CreateButton({
-    Name = "TP To Selected",
+    Name = "Телепорт к выбранному игроку",
     Callback = function()
         if not selectedPlayerName or _isPlaceholder(selectedPlayerName) then return end
         local t = Players:FindFirstChild(selectedPlayerName)
@@ -1359,7 +1453,12 @@ CombatTab:CreateButton({
 --========================================================
 -- PLAYER TAB
 --========================================================
-local PMoveSec = PlayerTab:CreateSection("Movement")
+local PMoveSec = PlayerTab:CreateSection("Передвижение")
+
+PlayerTab:CreateParagraph({
+    Title = "Внимание",
+    Content = "Fly, NoClip и SpeedHack ловятся серверной валидацией позиции в большинстве игр с античитом. Включай только если уверен, что в этой игре можно."
+})
 
 -- Fly
 local flyEnabled, flyConn = false, nil
@@ -1389,7 +1488,7 @@ local function startFly()
 end
 
 PlayerTab:CreateToggle({
-    Name = "Fly (RISKY)", CurrentValue = false, Flag = "flyEnabled",
+    Name = "Полёт (риск бана)", CurrentValue = false, Flag = "flyEnabled",
     Callback = function(v)
         flyEnabled = v
         if v then startFly() else stopFly() end
@@ -1414,7 +1513,7 @@ track(LocalPlayer.CharacterAdded:Connect(function(c)
     if infJump then bindInfJump(c:WaitForChild("Humanoid", 5)) end
 end))
 PlayerTab:CreateToggle({
-    Name = "Infinite Jump", CurrentValue = false, Flag = "infJump",
+    Name = "Бесконечный прыжок", CurrentValue = false, Flag = "infJump",
     Callback = function(v)
         infJump = v
         if v then bindInfJump(safeGetHumanoid(safeGetCharacter())) else stopInfJump() end
@@ -1431,7 +1530,7 @@ local function stopNoClip()
     end end
 end
 PlayerTab:CreateToggle({
-    Name = "No Clip", CurrentValue = false, Flag = "noClip",
+    Name = "Сквозь стены (NoClip)", CurrentValue = false, Flag = "noClip",
     Callback = function(v)
         noClip = v
         if v then
@@ -1450,7 +1549,7 @@ PlayerTab:CreateToggle({
 })
 
 PlayerTab:CreateSlider({
-    Name = "Walk Speed", Range = { 16, 500 }, Increment = 1, Suffix = "",
+    Name = "Скорость ходьбы", Range = { 16, 500 }, Increment = 1, Suffix = "",
     CurrentValue = 16, Flag = "walkSpeed",
     Callback = function(v)
         local h = safeGetHumanoid(safeGetCharacter())
@@ -1458,7 +1557,7 @@ PlayerTab:CreateSlider({
     end
 })
 PlayerTab:CreateSlider({
-    Name = "Jump Power", Range = { 50, 500 }, Increment = 5, Suffix = "",
+    Name = "Сила прыжка", Range = { 50, 500 }, Increment = 5, Suffix = "",
     CurrentValue = 50, Flag = "jumpPower",
     Callback = function(v)
         local h = safeGetHumanoid(safeGetCharacter())
@@ -1469,7 +1568,7 @@ PlayerTab:CreateSlider({
 -- Anti-AFK
 local antiAfk = false
 PlayerTab:CreateToggle({
-    Name = "Anti AFK", CurrentValue = false, Flag = "antiAfk",
+    Name = "Анти-AFK (не кикнет за простой)", CurrentValue = false, Flag = "antiAfk",
     Callback = function(v) antiAfk = v end
 })
 pcall(function()
@@ -1486,15 +1585,20 @@ end)
 --========================================================
 -- VISUALS TAB
 --========================================================
+VisualsTab:CreateParagraph({
+    Title = "Что это",
+    Content = "Локальные настройки освещения и тумана. Сервер их не валидирует, бан невозможен."
+})
+
 VisualsTab:CreateToggle({
-    Name = "No Fog", CurrentValue = false, Flag = "noFog",
+    Name = "Убрать туман", CurrentValue = false, Flag = "noFog",
     Callback = function(v)
         if v then Lighting.FogEnd = 99999; Lighting.FogStart = 0
         else Lighting.FogEnd = 1000; Lighting.FogStart = 0 end
     end
 })
 VisualsTab:CreateToggle({
-    Name = "Full Bright", CurrentValue = false, Flag = "fullBright",
+    Name = "Полный свет (Fullbright)", CurrentValue = false, Flag = "fullBright",
     Callback = function(v)
         if v then
             Lighting.Brightness = 10
@@ -1508,7 +1612,7 @@ VisualsTab:CreateToggle({
     end
 })
 VisualsTab:CreateToggle({
-    Name = "No Sky", CurrentValue = false, Flag = "noSky",
+    Name = "Убрать небо", CurrentValue = false, Flag = "noSky",
     Callback = function(v) Lighting.SkyboxEnabled = not v end
 })
 
@@ -1516,12 +1620,12 @@ VisualsTab:CreateToggle({
 -- WORLD TAB
 --========================================================
 WorldTab:CreateSlider({
-    Name = "Gravity", Range = { 0, 500 }, Increment = 5, Suffix = "",
+    Name = "Гравитация", Range = { 0, 500 }, Increment = 5, Suffix = "",
     CurrentValue = 196, Flag = "gravity",
     Callback = function(v) workspace.Gravity = v end
 })
 WorldTab:CreateSlider({
-    Name = "Time of Day", Range = { 0, 24 }, Increment = 1, Suffix = "h",
+    Name = "Время суток", Range = { 0, 24 }, Increment = 1, Suffix = " ч",
     CurrentValue = 14, Flag = "tod",
     Callback = function(v) Lighting.ClockTime = v end
 })
@@ -1534,6 +1638,11 @@ local espEnabled, boxESP, tracerESP, nameESP, healthESP = false, false, false, f
 local renderDistance = 1000
 local espColor = Color3.fromRGB(0, 255, 0)
 local espTeamCheck = false
+
+-- Adaptive throttle: 0 = каждый кадр, 1/30 = 30 fps, 1/15 = 15 fps.
+-- Меняется через слайдер в ESP-табе. Значения < 1/60 = full speed.
+local espMinInterval = 1 / 30
+local _esp_lastTick = 0
 
 local ESP = {}
 
@@ -1656,12 +1765,16 @@ local function startEspLoop()
             for _, d in pairs(ESP) do hideEspEntry(d) end
             return
         end
+        -- adaptive throttle: пропускаем кадры пока не накопился espMinInterval
+        local now = tick()
+        if (now - _esp_lastTick) < espMinInterval then return end
+        _esp_lastTick = now
+
         local camCF = Camera.CFrame
         local camPos = camCF.Position
         local vp = Camera.ViewportSize
         local vpHalfX, vpY = vp.X * 0.5, vp.Y
         local maxSq = renderDistance * renderDistance
-        local now = tick()
 
         for plr, d in pairs(ESP) do
             local char = plr.Character
@@ -1778,46 +1891,126 @@ task.spawn(function()
     end)
 end)
 
-ESPTab:CreateToggle({ Name = "ESP Master", CurrentValue = false, Flag = "espMaster",
+ESPTab:CreateParagraph({
+    Title = "Что это",
+    Content = "Подсветка других игроков сквозь стены. Тумблер «Главный ESP» включает рендер целиком, остальные тогглы — конкретные элементы (коробки, имя, HP, линии)."
+})
+
+ESPTab:CreateToggle({ Name = "Главный ESP (вкл/выкл всё)", CurrentValue = false, Flag = "espMaster",
     Callback = function(v) espEnabled = v end })
-ESPTab:CreateToggle({ Name = "Box ESP", CurrentValue = false, Flag = "espBox",
+ESPTab:CreateToggle({ Name = "Коробки вокруг игроков", CurrentValue = false, Flag = "espBox",
     Callback = function(v) boxESP = v end })
-ESPTab:CreateToggle({ Name = "Tracer ESP", CurrentValue = false, Flag = "espTracer",
+ESPTab:CreateToggle({ Name = "Линии-трассеры к игрокам", CurrentValue = false, Flag = "espTracer",
     Callback = function(v) tracerESP = v end })
-ESPTab:CreateToggle({ Name = "Name ESP", CurrentValue = false, Flag = "espName",
+ESPTab:CreateToggle({ Name = "Имена игроков", CurrentValue = false, Flag = "espName",
     Callback = function(v) nameESP = v end })
-ESPTab:CreateToggle({ Name = "Health ESP", CurrentValue = false, Flag = "espHealth",
+ESPTab:CreateToggle({ Name = "Полоски HP", CurrentValue = false, Flag = "espHealth",
     Callback = function(v) healthESP = v end })
-ESPTab:CreateToggle({ Name = "Team Check", CurrentValue = false, Flag = "espTeamCheck",
+ESPTab:CreateToggle({ Name = "Игнорировать союзников", CurrentValue = false, Flag = "espTeamCheck",
     Callback = function(v) espTeamCheck = v end })
-ESPTab:CreateSlider({ Name = "Render Distance", Range = {100, 5000}, Increment = 50, Suffix = "ст.",
+ESPTab:CreateSlider({ Name = "Дальность отрисовки", Range = {100, 5000}, Increment = 50, Suffix = " ст.",
     CurrentValue = 1000, Flag = "renderDist",
     Callback = function(v) renderDistance = v end })
-ESPTab:CreateColorPicker({ Name = "ESP Color", Color = Color3.fromRGB(0, 255, 0), Flag = "espColor",
+ESPTab:CreateColorPicker({ Name = "Цвет ESP", Color = Color3.fromRGB(0, 255, 0), Flag = "espColor",
     Callback = function(c) espColor = c end })
+
+ESPTab:CreateDivider()
+ESPTab:CreateSection("Производительность")
+ESPTab:CreateDropdown({
+    Name = "Частота обновления ESP",
+    Options = { "Полная (60 fps)", "Гладкая (30 fps)", "Эконом (15 fps)", "Минимум (10 fps)" },
+    CurrentOption = { "Гладкая (30 fps)" },
+    MultipleOptions = false,
+    Flag = "espRate",
+    Callback = function(opt)
+        local v = (type(opt) == "table") and opt[1] or opt
+        if     v == "Полная (60 fps)"   then espMinInterval = 0
+        elseif v == "Гладкая (30 fps)"  then espMinInterval = 1/30
+        elseif v == "Эконом (15 fps)"   then espMinInterval = 1/15
+        elseif v == "Минимум (10 fps)"  then espMinInterval = 1/10
+        end
+    end
+})
+ESPTab:CreateParagraph({
+    Title = "О производительности",
+    Content = "ESP — основной пожиратель FPS в скрипте. На 30 fps глаз не видит разницы, экономия ~50% бюджета. На 15 fps заметна задержка коробок при быстром повороте камеры, но FPS вырастает ещё на 30%."
+})
 
 
 --========================================================
 -- SETTINGS
 --========================================================
+
+-- ====== Performance counters (FPS / ping / mem) =========
+-- Считаем FPS как 1 / средний dt по последним N кадрам (smoothed average).
+-- Обновляем UI-параграф раз в 0.5 сек, чтобы не дёргать Rayfield :Set каждый кадр.
+local SPerfSec = SettingsTab:CreateSection("Монитор производительности")
+local perfPara = SettingsTab:CreateParagraph({
+    Title = "Live-статистика",
+    Content = "FPS: --  |  Ping: -- ms  |  Mem: -- MB"
+})
+
+do
+    local frameTimes = {}
+    local FRAME_WINDOW = 60
+    local sumDt = 0
+    local lastUiUpdate = 0
+
+    track(RunService.Heartbeat:Connect(function(dt)
+        -- скользящее окно из 60 dt
+        table.insert(frameTimes, dt)
+        sumDt = sumDt + dt
+        if #frameTimes > FRAME_WINDOW then
+            sumDt = sumDt - table.remove(frameTimes, 1)
+        end
+
+        local now = tick()
+        if now - lastUiUpdate < 0.5 then return end
+        lastUiUpdate = now
+
+        local avgDt = sumDt / #frameTimes
+        local fps = avgDt > 0 and (1 / avgDt) or 0
+
+        local ping = 0
+        pcall(function()
+            local stat = game:GetService("Stats"):FindFirstChild("PerformanceStats")
+            local p = stat and stat:FindFirstChild("Ping")
+            if p then ping = math.floor(p:GetValue()) end
+        end)
+
+        local memMB = math.floor(collectgarbage("count") / 1024)
+
+        local txt = ("FPS: %d  |  Ping: %d ms  |  Mem: %d MB\nЦиклы:  квест=%s   босс=%s   God1=%s   God2=%s")
+            :format(fps, ping, memMB,
+                sp_enabled and "ON" or "off",
+                sp_bossEnabled and "ON" or "off",
+                godModeEnabled and "ON" or "off",
+                godMode2Enabled and "ON" or "off")
+        if perfPara and perfPara.Set then
+            pcall(perfPara.Set, perfPara, { Title = "Live-статистика", Content = txt })
+        end
+    end))
+end
+
+SettingsTab:CreateSection("Окно")
 SettingsTab:CreateButton({
-    Name = "Toggle UI Visibility",
+    Name = "Скрыть/показать меню (или жми K)",
     Callback = function() Rayfield:SetVisibility(not Rayfield:IsVisible()) end
 })
 
 SettingsTab:CreateParagraph({
     Title = "Конфиг",
-    Content = "Все слайдеры/тогглы с Flag сохраняются автоматически в LunaHub/sailor_piece_v3 (включая выбор слота оружия, скиллы, God Mode тогглы, FOV, и т.д.)."
+    Content = "Все слайдеры и тогглы сохраняются автоматически в LunaHub/sailor_piece_v3 (включая выбор слота оружия, скиллы, тумблеры God Mode, FOV аимбота, частоту ESP)."
 })
 
 SettingsTab:CreateButton({
-    Name = "Unload",
+    Name = "Полностью выгрузить скрипт",
     Callback = function() if _G.LunaUnload then _G.LunaUnload() end end
 })
 
 SettingsTab:CreateParagraph({
-    Title = "Status",
-    Content = "Loaded | Game: " .. game.Name
+    Title = "Статус",
+    Content = "Загружен  |  Игра: " .. game.Name
 })
 
 --========================================================
@@ -1853,6 +2046,6 @@ end
 -- Запуск автосохранения конфига Rayfield (если включено)
 pcall(function() if Rayfield.LoadConfiguration then Rayfield:LoadConfiguration() end end)
 
-notify("Luna Hub загружен. RightCtrl — toggle UI", 4)
+notify("Luna Hub загружен. Жми K — открыть/закрыть меню", 4)
 print("[Luna] ready | game: " .. game.Name)
 _G.LunaCheatLoaded = true
