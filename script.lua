@@ -477,7 +477,7 @@ do
 
     -- Прогресс-бар: за 1.8с до 100%
     TweenService:Create(bar,
-        TweenInfo.new(1.8, Enum.EasingStyle.Quart, Enum.EasingDirection.Out),
+        TweenInfo.new(4.4, Enum.EasingStyle.Quart, Enum.EasingDirection.Out),
         { Size = UDim2.new(1, 0, 1, 0) }):Play()
 
     -- Статус по этапам
@@ -629,6 +629,8 @@ local sp_scanRadius    = 100
 local sp_searchRadius  = 200
 -- Длительность охоты квестового цикла
 local sp_huntDuration  = 60
+-- Сколько мобов убить за один забег к NPC. Квесты Sailor Piece обычно "убей 5".
+local sp_killsPerQuest = 5
 local sp_postQuestWait = 3   -- legacy, сейчас baked в spTakeQuestFrom
 
 -- Free Combat: бить без квеста (пропускает фазу TakeQuest, сразу Hunting).
@@ -782,6 +784,65 @@ end))
 -- ====================================================
 local sp_npcChoices = { "(нажми Scan)" }
 local sp_mobChoices = { "(нажми Scan)" }
+
+-- Утилита: получить DisplayName/HumanoidName модели для красивого отображения
+local function _spReadableLabel(model)
+    if not model then return "" end
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    local d = hum and hum.DisplayName
+    if d and d ~= "" then return d end
+    return ""
+end
+
+-- ВСЕ NPC из workspace.ServiceNPCs (без радиуса).
+-- Возвращает массив строк "CodeName  ▸  DisplayName" + map для извлечения кодового
+-- имени обратно. Вторая возвращаемая таблица: { ["CodeName ▸ Display"] = "CodeName" }.
+local function spScanAllNpcs()
+    local list = {}
+    local lookup = {}
+    local folder = spGetServiceFolder()
+    if not folder then return { "(нет ServiceNPCs)" }, lookup end
+    for _, c in ipairs(folder:GetChildren()) do
+        if c:IsA("Model") then
+            local code = c.Name
+            local label = _spReadableLabel(c)
+            local entry = (label ~= "") and (code .. "  ▸  " .. label) or code
+            if not lookup[entry] then
+                lookup[entry] = code
+                table.insert(list, entry)
+            end
+        end
+    end
+    table.sort(list)
+    if #list == 0 then table.insert(list, "(папка пуста)") end
+    return list, lookup
+end
+
+-- ВСЕ мобы из workspace.NPCs (без радиуса).
+-- Имена нормализованы (Monkey1/Monkey2 -> Monkey), но DisplayName первой
+-- найденной модели каждого типа подтягивается для понятности.
+local function spScanAllMobs()
+    local list = {}
+    local lookup = {}
+    local seen = {}
+    local folder = spGetNpcFolder()
+    if not folder then return { "(нет NPCs)" }, lookup end
+    for _, c in ipairs(folder:GetChildren()) do
+        if c:IsA("Model") then
+            local base = spStripTrailingDigits(c.Name)
+            if base ~= "" and not seen[base] then
+                seen[base] = true
+                local label = _spReadableLabel(c)
+                local entry = (label ~= "") and (base .. "  ▸  " .. label) or base
+                lookup[entry] = base
+                table.insert(list, entry)
+            end
+        end
+    end
+    table.sort(list)
+    if #list == 0 then table.insert(list, "(папка пуста)") end
+    return list, lookup
+end
 
 local function spScanAreaNpcs()
     local list, seen = {}, {}
@@ -1064,11 +1125,16 @@ local function spStart()
                 end
             elseif _G.QuestState == "Hunting" then
                 local huntStart = tick()
+                local kills = 0
                 notify(("Hunt %ds: %s"):format(sp_huntDuration, sp_mobBaseName))
                 while sp_enabled
                     and _G.QuestState == "Hunting"
                     -- Free Combat игнорирует таймер охоты (фармим вечно)
                     and (sp_freeCombat or (tick() - huntStart) < sp_huntDuration)
+                    -- Лимит на убийства за один квестовый "забег". В Sailor Piece
+                    -- большинство квестов = "убей 5 мобов". После лимита возвращаемся
+                    -- к NPC сдать квест и взять новый.
+                    and (sp_freeCombat or kills < sp_killsPerQuest)
                 do
                     local mob = spFindMob(sp_mobBaseName)
                     if not mob then
@@ -1113,9 +1179,21 @@ local function spStart()
                             end
                             task.wait(sp_attackDelay)
                         end
+                        -- Если моб умер (HP <= 0 или Parent == nil) — это кил.
+                        -- Если мы вышли по другому условию (timeout, sp_enabled = false) —
+                        -- кил не считаем.
+                        if not mob.Parent or (mobHum and mobHum.Health <= 0) then
+                            kills = kills + 1
+                            notify(("Kill %d/%d"):format(kills, sp_killsPerQuest), 1.5)
+                        end
                         sp_currentMob = nil
                         task.wait(0.1)
                     end
+                end
+                -- Достигли лимита убийств — обратно к NPC сдавать квест
+                if not sp_freeCombat and kills >= sp_killsPerQuest then
+                    notify(("Квест выполнен ({}). Возвращаюсь к NPC")
+                        :gsub("{}", tostring(kills)), 2)
                 end
                 _G.QuestState = sp_freeCombat and "Hunting" or "TakeQuest"
                 task.wait(0.3)
@@ -1563,6 +1641,20 @@ SailorTab:CreateParagraph({
 
 -- ===== Quest Setup =====
 local npcDropdown, mobDropdown
+-- Lookup'ы: для дропдаунов с гибридными лейблами "Code ▸ Display"
+-- map: { ["QuestNPC4 ▸ Friendly NPC"] = "QuestNPC4" }
+-- Если лейбл = просто кодовое имя (без DisplayName), lookup всё равно есть.
+local sp_npcLookup = {}
+local sp_mobLookup = {}
+
+local function _resolveNpcCode(label)
+    if not label or _isPlaceholder(label) then return nil end
+    return sp_npcLookup[label] or label   -- если в lookup нет — берём как есть
+end
+local function _resolveMobCode(label)
+    if not label or _isPlaceholder(label) then return nil end
+    return sp_mobLookup[label] or label
+end
 
 npcDropdown = SailorTab:CreateDropdown({
     Name = "NPC квеста",
@@ -1572,7 +1664,8 @@ npcDropdown = SailorTab:CreateDropdown({
     Flag = "sp_questNpc",
     Callback = function(opt)
         local v = (type(opt) == "table") and opt[1] or opt
-        if v and not _isPlaceholder(v) then sp_questNpcName = v end
+        local code = _resolveNpcCode(v)
+        if code then sp_questNpcName = code end
     end
 })
 
@@ -1584,7 +1677,8 @@ mobDropdown = SailorTab:CreateDropdown({
     Flag = "sp_mob",
     Callback = function(opt)
         local v = (type(opt) == "table") and opt[1] or opt
-        if v and not _isPlaceholder(v) then sp_mobBaseName = v end
+        local code = _resolveMobCode(v)
+        if code then sp_mobBaseName = code end
     end
 })
 
@@ -1592,10 +1686,11 @@ SailorTab:CreateButton({
     Name = "Сканировать NPC рядом",
     Callback = function()
         sp_npcChoices = spScanAreaNpcs()
+        sp_npcLookup = {}   -- area-scan возвращает плоский список без DisplayName
         if npcDropdown and npcDropdown.Refresh then
             pcall(npcDropdown.Refresh, npcDropdown, sp_npcChoices)
         end
-        notify(("Найдено NPC: %d"):format(#sp_npcChoices))
+        notify(("Найдено NPC рядом: %d"):format(#sp_npcChoices))
     end
 })
 
@@ -1603,16 +1698,47 @@ SailorTab:CreateButton({
     Name = "Сканировать мобов рядом",
     Callback = function()
         sp_mobChoices = spScanAreaMobs()
+        sp_mobLookup = {}
         if mobDropdown and mobDropdown.Refresh then
             pcall(mobDropdown.Refresh, mobDropdown, sp_mobChoices)
         end
-        notify(("Найдено мобов: %d"):format(#sp_mobChoices))
+        notify(("Найдено мобов рядом: %d"):format(#sp_mobChoices))
+    end
+})
+
+-- ⭐ Сканеры ВСЕЙ карты (без радиуса) с гибридными именами Code ▸ DisplayName
+SailorTab:CreateButton({
+    Name = "🔍 Все NPC карты (workspace.ServiceNPCs)",
+    Callback = function()
+        local list, lookup = spScanAllNpcs()
+        sp_npcChoices = list
+        sp_npcLookup = lookup
+        if npcDropdown and npcDropdown.Refresh then
+            pcall(npcDropdown.Refresh, npcDropdown, sp_npcChoices)
+        end
+        notify(("Всего NPC: %d"):format(#sp_npcChoices))
+        for _, n in ipairs(sp_npcChoices) do print("  NPC: " .. n) end
+    end
+})
+
+SailorTab:CreateButton({
+    Name = "🔍 Все мобы карты (workspace.NPCs)",
+    Callback = function()
+        local list, lookup = spScanAllMobs()
+        sp_mobChoices = list
+        sp_mobLookup = lookup
+        if mobDropdown and mobDropdown.Refresh then
+            pcall(mobDropdown.Refresh, mobDropdown, sp_mobChoices)
+        end
+        notify(("Всего мобов: %d"):format(#sp_mobChoices))
+        for _, n in ipairs(sp_mobChoices) do print("  Mob: " .. n) end
     end
 })
 
 SailorTab:CreateParagraph({
     Title = "О сканере",
-    Content = "Кнопки находят квестовых NPC (workspace.ServiceNPCs) и мобов (workspace.NPCs) только в радиусе сканирования от тебя. Для мобов имена нормализуются: «Monkey1», «Monkey2» → «Monkey»."
+    Content = "▸ «Рядом» — ищет в радиусе слайдера ниже (быстрее, меньше мусора).\n" ..
+              "▸ «Все карты» — пробегает ВСЁ workspace.ServiceNPCs / workspace.NPCs. Имена показываются в формате «КодовоеИмя ▸ DisplayName», как видно в Sailor Piece (например «MonkeyBoss ▸ Monkey Boss [Lv. 500]»). Удобно когда не знаешь куда лететь."
 })
 
 SailorTab:CreateSlider({
@@ -1636,13 +1762,28 @@ SailorTab:CreateSlider({
 })
 
 SailorTab:CreateSlider({
-    Name = "Длительность охоты",
+    Name = "Длительность охоты (макс. время до возврата)",
     Range = { 15, 300 },
     Increment = 5,
     Suffix = " сек",
     CurrentValue = sp_huntDuration,
     Flag = "sp_huntDuration",
     Callback = function(v) sp_huntDuration = v end
+})
+
+SailorTab:CreateSlider({
+    Name = "Убийств на один квест",
+    Range = { 1, 30 },
+    Increment = 1,
+    Suffix = "",
+    CurrentValue = sp_killsPerQuest,
+    Flag = "sp_killsPerQuest",
+    Callback = function(v) sp_killsPerQuest = v end
+})
+
+SailorTab:CreateParagraph({
+    Title = "Логика возврата к NPC",
+    Content = "Скрипт идёт обратно к NPC сдать квест когда выполняется ЛЮБОЕ из условий:\n• Убил «Убийств на один квест» мобов (по умолчанию 5)\n• Прошло «Длительность охоты» секунд (по умолчанию 60)\n• Моб не найден в радиусе поиска\n\nFree Combat игнорирует оба лимита и фармит вечно."
 })
 
 SailorTab:CreateSlider({
@@ -1751,17 +1892,18 @@ SailorTab:CreateToggle({ Name = "Скилл F", CurrentValue = sp_useF, Flag = "
 
 -- ===== God Mode =====
 SailorTab:CreateDivider()
-local SGodSec = SailorTab:CreateSection("God Mode")
+local SGodSec = SailorTab:CreateSection("God Mode и защита от урона")
 
 SailorTab:CreateParagraph({
-    Title = "Что это",
-    Content = "v1 — клиентский Noclip + парение над целью на заданной высоте. Работает против melee-боссов и AOE-сплеша.\n\n" ..
-              "v2 — постоянное восстановление HP до максимума + блокировка состояния «Dead» у твоего Humanoid. Полезно когда игра доверяет клиенту HP.\n\n" ..
-              "Можно включить оба одновременно — друг другу не мешают."
+    Title = "Честно про God Mode в Sailor Piece",
+    Content = "Sailor Piece — серверно-авторизованная игра. Сервер сам считает HP и replicate'ит его клиенту.\n\n" ..
+              "▸ v1 (Noclip + парение) — работает: ты летаешь над целью, melee и AOE не достают. Обычные мобы теряют тебя.\n\n" ..
+              "▸ v2 (HP-restore) — на 99% игр НЕ РАБОТАЕТ. Сервер перезапишет HP обратно через replication. Оставляю в коде, может в каком-то ивенте сработает.\n\n" ..
+              "▸ ⭐ Anti-Damage Anchor (ниже) — единственный реальный способ против шот-боссов. Поднимает на 50-200 ст. + якорит. Большинство атак не достанут хитбокс."
 })
 
 SailorTab:CreateToggle({
-    Name = "God Mode v1 — Noclip + парение",
+    Name = "God Mode v1 — Noclip + парение (рабочий)",
     CurrentValue = false,
     Flag = "godModeV1",
     Callback = function(v)
@@ -1771,7 +1913,7 @@ SailorTab:CreateToggle({
 })
 
 SailorTab:CreateToggle({
-    Name = "God Mode v2 — восстановление HP",
+    Name = "God Mode v2 — HP-restore (визуальный)",
     CurrentValue = false,
     Flag = "godModeV2",
     Callback = function(v)
@@ -2787,6 +2929,7 @@ local function _serializeSettings()
         sp_scanRadius   = sp_scanRadius,
         sp_searchRadius = sp_searchRadius,
         sp_huntDuration = sp_huntDuration,
+        sp_killsPerQuest = sp_killsPerQuest,
         sp_hoverHeight  = sp_hoverHeight,
         sp_attackDelay  = sp_attackDelay,
         sp_skillDelay   = sp_skillDelay,
@@ -2808,6 +2951,7 @@ local function _applySettings(t)
     sp_scanRadius   = t.sp_scanRadius   or sp_scanRadius
     sp_searchRadius = t.sp_searchRadius or sp_searchRadius
     sp_huntDuration = t.sp_huntDuration or sp_huntDuration
+    sp_killsPerQuest = t.sp_killsPerQuest or sp_killsPerQuest
     sp_hoverHeight  = t.sp_hoverHeight  or sp_hoverHeight
     sp_attackDelay  = t.sp_attackDelay  or sp_attackDelay
     sp_skillDelay   = t.sp_skillDelay   or sp_skillDelay
@@ -2946,7 +3090,7 @@ do
 end
 
 -- Убираем splash через 2.2 сек (совпадает с финишем анимации прогресс-бара)
-task.delay(2.2, function() pcall(destroySplash) end)
+task.delay(4.4, function() pcall(destroySplash) end)
 
 notify("Luna Hub загружен. RightCtrl — открыть/закрыть меню", 4)
 print("[Luna] ready | game: " .. game.Name)
