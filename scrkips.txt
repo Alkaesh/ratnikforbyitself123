@@ -1,0 +1,1858 @@
+--========================================================
+-- LUNA HUB - Sailor Piece (Rayfield Edition)
+-- Полный рерайт UI на Rayfield + config save/load
+--========================================================
+
+-- ===== reload guard =====
+if _G.LunaCheatLoaded then
+    if type(_G.LunaUnload) == "function" then pcall(_G.LunaUnload) end
+    _G.LunaCheatLoaded = false
+    _G.LunaUnload = nil
+end
+
+-- Подчищаем рудименты от прошлых сессий: и Kavo (старый ScreenGui с "Main"),
+-- и Rayfield (его контейнер называется "Rayfield").
+pcall(function()
+    local function purge(parent)
+        for _, c in ipairs(parent:GetChildren()) do
+            if c:IsA("ScreenGui") and (c.Name == "Rayfield" or c:FindFirstChild("Main")) then
+                pcall(function() c:Destroy() end)
+            end
+        end
+    end
+    purge(game:GetService("CoreGui"))
+    if gethui then
+        local ok, hui = pcall(gethui)
+        if ok and hui then purge(hui) end
+    end
+    for _, k in ipairs({"LunaTracerGui", "LunaFovGui", "LunaWindowGui"}) do
+        if typeof(_G[k]) == "Instance" then
+            pcall(function() _G[k]:Destroy() end)
+            _G[k] = nil
+        end
+    end
+end)
+
+-- ===== services =====
+local okSvc, Players, RunService, UIS, Camera, Lighting, LocalPlayer, ReplicatedStorage, HttpService =
+    pcall(function()
+        local P = game:GetService("Players")
+        local lp = P.LocalPlayer
+        local t0 = tick()
+        while not lp and tick() - t0 < 10 do
+            task.wait(0.1)
+            lp = P.LocalPlayer
+        end
+        return P,
+            game:GetService("RunService"),
+            game:GetService("UserInputService"),
+            workspace.CurrentCamera,
+            game:GetService("Lighting"),
+            lp,
+            game:GetService("ReplicatedStorage"),
+            game:GetService("HttpService")
+    end)
+
+if not okSvc or not Players or not LocalPlayer then
+    warn("[Luna] Игра не поддерживается (DataModel: " .. tostring(game.Name) .. ")")
+    return
+end
+
+local VIM
+pcall(function() VIM = game:GetService("VirtualInputManager") end)
+
+-- ===== загрузка Rayfield =====
+local Rayfield
+do
+    local sources = {
+        "https://sirius.menu/rayfield",
+        "https://raw.githubusercontent.com/SiriusSoftwareLtd/Rayfield/main/source.lua",
+    }
+    local lastErr
+    for _, url in ipairs(sources) do
+        local ok, lib = pcall(function()
+            return loadstring(game:HttpGet(url))()
+        end)
+        if ok and type(lib) == "table" and lib.CreateWindow then
+            Rayfield = lib
+            break
+        else
+            lastErr = tostring(lib)
+        end
+    end
+    if not Rayfield then
+        warn("[Luna] Не удалось загрузить Rayfield: " .. tostring(lastErr))
+        return
+    end
+end
+
+-- ===== соединения =====
+local allConnections = {}
+local function track(conn)
+    if conn then table.insert(allConnections, conn) end
+    return conn
+end
+
+-- ===== утилиты =====
+local function notify(msg, dur)
+    pcall(function()
+        Rayfield:Notify({ Title = "Luna", Content = tostring(msg),
+            Duration = dur or 3, Image = 4483362458 })
+    end)
+    print("[Luna] " .. tostring(msg))
+end
+
+local function safeGetCharacter()
+    return LocalPlayer and LocalPlayer.Character or nil
+end
+local function safeGetHumanoid(c)
+    return c and c:FindFirstChildOfClass("Humanoid") or nil
+end
+local function safeGetHRP(c)
+    return c and c:FindFirstChild("HumanoidRootPart") or nil
+end
+
+local function isSameTeam(plr)
+    if not LocalPlayer then return false end
+    if plr.Team and LocalPlayer.Team and plr.Team == LocalPlayer.Team then return true end
+    if plr.TeamColor and LocalPlayer.TeamColor and plr.TeamColor == LocalPlayer.TeamColor then return true end
+    return false
+end
+
+local function randomName()
+    local s, t = "abcdefghijklmnopqrstuvwxyz", {}
+    for i = 1, math.random(8, 14) do
+        local k = math.random(1, #s)
+        t[i] = s:sub(k, k)
+    end
+    return table.concat(t)
+end
+
+local hiddenParent
+pcall(function()
+    if gethui then hiddenParent = gethui() end
+end)
+hiddenParent = hiddenParent or game:GetService("CoreGui")
+
+-- ===== окно Rayfield =====
+local Window = Rayfield:CreateWindow({
+    Name = "Luna Hub | Sailor Piece",
+    LoadingTitle = "Luna Hub",
+    LoadingSubtitle = "loading modules...",
+    Theme = "Default",
+    ToggleUIKeybind = "RightControl",
+    DisableBuildWarnings = true,
+    ConfigurationSaving = {
+        Enabled = true,
+        FolderName = "LunaHub",
+        FileName = "sailor_piece_v3"
+    },
+    Discord = { Enabled = false },
+    KeySystem = false
+})
+
+-- Создаём табы заранее, чтобы можно было ссылаться из любого места
+local SailorTab  = Window:CreateTab("Sailor Piece", 4483362458)
+local CombatTab  = Window:CreateTab("Combat",       4483345998)
+local PlayerTab  = Window:CreateTab("Player",       7733715400)
+local VisualsTab = Window:CreateTab("Visuals",      4483345998)
+local ESPTab     = Window:CreateTab("ESP",          7734053495)
+local WorldTab   = Window:CreateTab("World",        4483345998)
+local SettingsTab = Window:CreateTab("Settings",    4483345998)
+
+
+--========================================================
+-- SAILOR PIECE — Auto Quest Farm
+--========================================================
+local SQuestSec  = SailorTab:CreateSection("Quest Setup")
+
+-- ===== state =====
+-- Квестовый цикл
+local sp_questNpcName  = ""
+local sp_mobBaseName   = ""
+local sp_scanRadius    = 100
+local sp_searchRadius  = 200
+local sp_huntDuration  = 60
+local sp_postQuestWait = 3   -- legacy, сейчас baked в spTakeQuestFrom
+
+-- Бой
+local sp_attackDelay   = 0.25
+local sp_skillDelay    = 0.8
+local sp_skillHold     = 0.1
+local sp_useHandsOnly  = false   -- если true — клики не идут когда оружие отсутствует
+local sp_handFightOff  = false   -- true = отключить клики мыши вообще (только скиллы)
+local sp_useZ, sp_useX, sp_useC, sp_useV, sp_useF = true, true, true, true, true
+
+-- Слот оружия (1..5). При respawn автоматически экипируем.
+local sp_weaponSlot = 1
+local sp_autoEquip  = true
+
+-- Hover/God Mode
+local sp_hoverHeight = 7
+local sp_maxSpeed    = 110
+local sp_stepRate    = 30
+
+-- Глобал состояния
+_G.QuestState = _G.QuestState or "TakeQuest"   -- "TakeQuest" | "Hunting"
+
+-- Боевая цель — God Mode читает её, чтобы держать нас над мобом.
+local sp_currentMob = nil
+
+-- Forward decls (нужны для замыканий, ссылающихся на boss-фарм / God Mode / unload)
+local sp_enabled, sp_loopThread = false, nil
+local sp_bossEnabled, sp_bossThread = false, nil
+local godModeEnabled = false
+local godMode2Enabled = false
+
+local function spStop()  end   -- placeholder, реальные функции ниже
+local function spBossStop() end
+local function stopGodMode() end
+local function stopGodMode2() end
+
+-- ====================================================
+-- Папки
+-- ====================================================
+local function spGetNpcFolder()     return workspace:FindFirstChild("NPCs")        end
+local function spGetServiceFolder() return workspace:FindFirstChild("ServiceNPCs") end
+
+-- ====================================================
+-- Утилиты
+-- ====================================================
+local function spStripTrailingDigits(s)
+    if type(s) ~= "string" then return "" end
+    local cleaned = s:gsub("%d+$", "")
+    if cleaned == "" then return s end
+    return cleaned
+end
+
+local function spModelPos(model)
+    if not model then return nil end
+    local hrp = model:FindFirstChild("HumanoidRootPart")
+        or model:FindFirstChild("Torso") or model.PrimaryPart
+    if hrp and hrp.Position then return hrp.Position end
+    local ok, cf = pcall(function() return model:GetBoundingBox() end)
+    if ok and cf then return cf.Position end
+    return nil
+end
+
+-- ====================================================
+-- Оружие: переключение слотов 1..5 через VIM
+-- ====================================================
+local function spSelectSlot(slot)
+    if not slot or slot < 1 or slot > 5 then return end
+    if not VIM then return end
+    -- 49..53 = Enum.KeyCode.One..Five
+    local keyCodes = { Enum.KeyCode.One, Enum.KeyCode.Two, Enum.KeyCode.Three, Enum.KeyCode.Four, Enum.KeyCode.Five }
+    pcall(function()
+        VIM:SendKeyEvent(true,  keyCodes[slot], false, game)
+        task.wait(0.05)
+        VIM:SendKeyEvent(false, keyCodes[slot], false, game)
+    end)
+end
+
+-- Проверить что в руке есть Tool. Если нет — переключиться на sp_weaponSlot.
+-- Возвращает текущий Tool в Character'е (или nil).
+local function spEnsureWeapon()
+    local char = safeGetCharacter()
+    if not char then return nil end
+    local tool = char:FindFirstChildOfClass("Tool")
+    if tool then return tool end
+
+    if not sp_autoEquip then return nil end
+
+    -- Сначала пробуем выбрать конкретный слот
+    spSelectSlot(sp_weaponSlot)
+    task.wait(0.15)
+    tool = char:FindFirstChildOfClass("Tool")
+    if tool then return tool end
+
+    -- Fallback: первый Tool в Backpack через Humanoid:EquipTool
+    local hum = safeGetHumanoid(char)
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+    if hum and backpack then
+        local first = backpack:FindFirstChildOfClass("Tool")
+        if first then
+            pcall(function() hum:EquipTool(first) end)
+            task.wait(0.2)
+            tool = char:FindFirstChildOfClass("Tool")
+        end
+    end
+    return tool
+end
+
+-- При respawn автоматически переэкипируем выбранный слот (игра по дефолту берёт #1).
+track(LocalPlayer.CharacterAdded:Connect(function(char)
+    if sp_autoEquip then
+        char:WaitForChild("Humanoid", 5)
+        task.wait(0.6)
+        spSelectSlot(sp_weaponSlot)
+    end
+end))
+
+-- ====================================================
+-- Сканер зоны
+-- ====================================================
+local sp_npcChoices = { "(нажми Scan)" }
+local sp_mobChoices = { "(нажми Scan)" }
+
+local function spScanAreaNpcs()
+    local list, seen = {}, {}
+    local folder = spGetServiceFolder()
+    if not folder then return { "(нет ServiceNPCs)" } end
+    local myHRP = safeGetHRP(safeGetCharacter())
+    if not myHRP then return { "(нет персонажа)" } end
+    local origin, r2 = myHRP.Position, sp_scanRadius * sp_scanRadius
+    for _, c in ipairs(folder:GetChildren()) do
+        if c:IsA("Model") and not seen[c.Name] then
+            local p = spModelPos(c)
+            if p and (p - origin).Magnitude <= sp_scanRadius then
+                seen[c.Name] = true
+                table.insert(list, c.Name)
+            end
+        end
+    end
+    table.sort(list)
+    if #list == 0 then table.insert(list, "(нет NPC в радиусе)") end
+    return list
+end
+
+local function spScanAreaMobs()
+    local list, seen = {}, {}
+    local folder = spGetNpcFolder()
+    if not folder then return { "(нет NPCs)" } end
+    local myHRP = safeGetHRP(safeGetCharacter())
+    if not myHRP then return { "(нет персонажа)" } end
+    local origin = myHRP.Position
+    for _, c in ipairs(folder:GetChildren()) do
+        if c:IsA("Model") then
+            local p = spModelPos(c)
+            if p and (p - origin).Magnitude <= sp_scanRadius then
+                local base = spStripTrailingDigits(c.Name)
+                if base ~= "" and not seen[base] then
+                    seen[base] = true
+                    table.insert(list, base)
+                end
+            end
+        end
+    end
+    table.sort(list)
+    if #list == 0 then table.insert(list, "(нет мобов в радиусе)") end
+    return list
+end
+
+-- ====================================================
+-- Поиск моба / NPC по имени
+-- ====================================================
+local function _isPlaceholder(s)
+    return not s or s == "" or s:sub(1, 1) == "("
+end
+
+local function spFindMob(baseName)
+    if _isPlaceholder(baseName) then return nil end
+    local folder = spGetNpcFolder()
+    if not folder then return nil end
+    local myHRP = safeGetHRP(safeGetCharacter())
+    local origin = myHRP and myHRP.Position or Vector3.zero
+    local best, bestDist = nil, math.huge
+    for _, mob in ipairs(folder:GetChildren()) do
+        if mob:IsA("Model") and string.find(mob.Name, baseName, 1, true) then
+            local hum = mob:FindFirstChildOfClass("Humanoid")
+            local p = spModelPos(mob)
+            if hum and hum.Health > 0 and p then
+                local d = (p - origin).Magnitude
+                if d < bestDist and d <= sp_searchRadius then
+                    bestDist = d
+                    best = mob
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function spFindQuestNpc(npcName)
+    if _isPlaceholder(npcName) then return nil end
+    local folder = spGetServiceFolder()
+    if not folder then return nil end
+    return folder:FindFirstChild(npcName)
+end
+
+-- ====================================================
+-- Плавный TP с лимитом скорости
+-- ====================================================
+local _sp_forcedTp = false
+local function spSmoothTeleportTo(targetCFrame)
+    local char = safeGetCharacter()
+    local hrp  = safeGetHRP(char)
+    if not hrp then return end
+    local startCF = hrp.CFrame
+    local dist = (targetCFrame.Position - startCF.Position).Magnitude
+    if dist < 0.5 then
+        hrp.CFrame = targetCFrame
+        return
+    end
+    local maxSpeed = math.max(20, sp_maxSpeed)
+    local rate     = math.clamp(sp_stepRate, 10, 60)
+    local steps    = math.max(2, math.ceil((dist / maxSpeed) * rate))
+    local dt       = 1 / rate
+    for i = 1, steps do
+        if not sp_enabled and not sp_bossEnabled and not _sp_forcedTp then return end
+        hrp.CFrame = startCF:Lerp(targetCFrame, i / steps)
+        task.wait(dt)
+    end
+end
+
+-- ====================================================
+-- Атака: VIM клики + клавиши
+-- ====================================================
+local _sp_lastClick = 0
+local function spMouseClick()
+    if sp_handFightOff then return end
+    if not VIM then return end
+    local now = tick()
+    if now - _sp_lastClick < sp_attackDelay then return end
+    _sp_lastClick = now
+
+    local tool = spEnsureWeapon()
+    if sp_useHandsOnly == false and not tool then
+        -- ничего в руках — но битьё руками включено, значит всё равно клик
+    elseif sp_useHandsOnly and not tool then
+        return   -- "только с оружием" и оружия нет — пропускаем клик
+    end
+
+    pcall(function()
+        VIM:SendMouseButtonEvent(0, 0, 0, true,  game, 1)
+        task.wait(0.03)
+        VIM:SendMouseButtonEvent(0, 0, 0, false, game, 1)
+    end)
+end
+
+local function spPressKey(keyCode)
+    if not VIM then return end
+    pcall(function()
+        VIM:SendKeyEvent(true,  keyCode, false, game)
+        task.wait(sp_skillHold)
+        VIM:SendKeyEvent(false, keyCode, false, game)
+    end)
+end
+
+-- Собрать массив скилл-клавиш в зависимости от тогглов
+local function spActiveSkillKeys()
+    local t = {}
+    if sp_useZ then table.insert(t, Enum.KeyCode.Z) end
+    if sp_useX then table.insert(t, Enum.KeyCode.X) end
+    if sp_useC then table.insert(t, Enum.KeyCode.C) end
+    if sp_useV then table.insert(t, Enum.KeyCode.V) end
+    if sp_useF then table.insert(t, Enum.KeyCode.F) end
+    return t
+end
+
+
+-- ====================================================
+-- Удержание над мобом
+-- ====================================================
+local function spHoverAbove(mob)
+    if not mob or not mob.Parent then return end
+    -- God Mode v1 сам поднимает в Heartbeat — не дёргаем тут
+    if godModeEnabled then return end
+    local char = safeGetCharacter()
+    local hum  = safeGetHumanoid(char)
+    local hrp  = safeGetHRP(char)
+    if not (hum and hrp) then return end
+    local mobHead = mob:FindFirstChild("Head")
+        or mob:FindFirstChild("HumanoidRootPart") or mob.PrimaryPart
+    if not mobHead then return end
+    local headPos = mobHead.Position
+    local eye = headPos + Vector3.new(0, sp_hoverHeight, 0)
+    pcall(function()
+        hum.PlatformStand = false
+        hrp.AssemblyLinearVelocity = Vector3.zero
+        hrp.CFrame = CFrame.lookAt(eye, headPos)
+    end)
+end
+
+-- ====================================================
+-- Взятие квеста (AFK-режим: 0.8с задержка + 3с repeat-prompt)
+-- ====================================================
+local function spTakeQuestFrom(npc)
+    if not npc then return end
+    local hrpPos = spModelPos(npc)
+    local myHRP  = safeGetHRP(safeGetCharacter())
+    if not (hrpPos and myHRP) then return end
+
+    spSmoothTeleportTo(CFrame.new(hrpPos + Vector3.new(0, 0, 4), hrpPos))
+    task.wait(0.8)
+
+    local prompts, clicks = {}, {}
+    for _, d in ipairs(npc:GetDescendants()) do
+        if d:IsA("ProximityPrompt") then table.insert(prompts, d)
+        elseif d:IsA("ClickDetector") then table.insert(clicks, d) end
+    end
+
+    local deadline = tick() + 3
+    repeat
+        for _, p in ipairs(prompts) do
+            pcall(function()
+                if fireproximityprompt then fireproximityprompt(p) end
+            end)
+        end
+        if #prompts == 0 then
+            for _, cd in ipairs(clicks) do
+                pcall(function()
+                    if fireclickdetector then fireclickdetector(cd) end
+                end)
+            end
+        end
+        task.wait(0.5)
+    until tick() >= deadline
+end
+
+-- ====================================================
+-- Главный квестовый цикл
+-- ====================================================
+local function spStart()
+    if sp_loopThread then return end
+    if _isPlaceholder(sp_questNpcName) then
+        notify("Сначала Scan + выбор NPC")
+        return
+    end
+    if _isPlaceholder(sp_mobBaseName) then
+        notify("Сначала Scan + выбор моба")
+        return
+    end
+    if sp_bossEnabled then
+        spBossStop()
+    end
+
+    sp_enabled = true
+    _G.QuestState = "TakeQuest"
+
+    sp_loopThread = task.spawn(function()
+        while sp_enabled do
+            local hum = safeGetHumanoid(safeGetCharacter())
+            if not hum or hum.Health <= 0 then
+                sp_currentMob = nil
+                task.wait(1)
+            elseif _G.QuestState == "TakeQuest" then
+                sp_currentMob = nil
+                local npc = spFindQuestNpc(sp_questNpcName)
+                if npc then
+                    notify("Беру квест у " .. sp_questNpcName)
+                    spTakeQuestFrom(npc)
+                    _G.QuestState = "Hunting"
+                else
+                    notify("NPC не найден: " .. sp_questNpcName)
+                    task.wait(2)
+                end
+            elseif _G.QuestState == "Hunting" then
+                local huntStart = tick()
+                notify(("Hunt %ds: %s"):format(sp_huntDuration, sp_mobBaseName))
+                while sp_enabled
+                    and _G.QuestState == "Hunting"
+                    and (tick() - huntStart) < sp_huntDuration
+                do
+                    local mob = spFindMob(sp_mobBaseName)
+                    if not mob then
+                        notify("Моба нет — обратно к NPC")
+                        break
+                    end
+                    sp_currentMob = mob
+
+                    if not godModeEnabled then
+                        local p = spModelPos(mob)
+                        if p then
+                            spSmoothTeleportTo(CFrame.lookAt(
+                                p + Vector3.new(0, sp_hoverHeight, 0), p))
+                        end
+                    end
+
+                    local skillKeys = spActiveSkillKeys()
+                    local skillIdx, lastSkill = 1, tick()
+                    local mobHum = mob:FindFirstChildOfClass("Humanoid")
+
+                    while sp_enabled
+                        and _G.QuestState == "Hunting"
+                        and mob.Parent
+                        and mobHum and mobHum.Health > 0
+                        and (tick() - huntStart) < sp_huntDuration
+                    do
+                        spHoverAbove(mob)
+                        spMouseClick()
+                        if #skillKeys > 0 and (tick() - lastSkill) >= sp_skillDelay then
+                            spPressKey(skillKeys[skillIdx])
+                            skillIdx = (skillIdx % #skillKeys) + 1
+                            lastSkill = tick()
+                        end
+                        task.wait(sp_attackDelay)
+                    end
+                    sp_currentMob = nil
+                    task.wait(0.1)
+                end
+                _G.QuestState = "TakeQuest"
+                task.wait(0.3)
+            else
+                _G.QuestState = "TakeQuest"
+                task.wait(0.2)
+            end
+            task.wait(0.05)
+        end
+        sp_currentMob = nil
+        sp_loopThread = nil
+    end)
+end
+
+-- override placeholder
+spStop = function()
+    sp_enabled = false
+    sp_currentMob = nil
+    sp_loopThread = nil
+end
+
+-- ====================================================
+-- RAID BOSSES
+-- ====================================================
+local EliteBosses = {
+    ["Black Reaper"] = "BlackReaperBoss",
+    ["Monkey Boss"]  = "Monkey Boss",
+    ["Thief Boss"]   = "ThiefBoss",
+}
+local EliteBossOrder = { "Black Reaper", "Monkey Boss", "Thief Boss" }
+local sp_bossDisplayName = EliteBossOrder[1]
+local sp_bossRootName    = EliteBosses[sp_bossDisplayName]
+
+local function spFindBoss(rootName)
+    if not rootName or rootName == "" then return nil end
+    local folder = spGetNpcFolder()
+    if not folder then return nil end
+    local myHRP  = safeGetHRP(safeGetCharacter())
+    local origin = myHRP and myHRP.Position or Vector3.zero
+    local best, bestHum, bestDist = nil, nil, math.huge
+    for _, m in ipairs(folder:GetChildren()) do
+        if m:IsA("Model") and string.find(m.Name, rootName, 1, true) then
+            local hum = m:FindFirstChildOfClass("Humanoid")
+            local p   = spModelPos(m)
+            if hum and hum.Health > 0 and p then
+                local d = (p - origin).Magnitude
+                if d < bestDist then
+                    bestDist, best, bestHum = d, m, hum
+                end
+            end
+        end
+    end
+    return best, bestHum
+end
+
+local function spBossStart()
+    if sp_bossThread then return end
+    if not sp_bossRootName or sp_bossRootName == "" then
+        notify("Выбери босса в дропдауне")
+        return
+    end
+    if sp_enabled then spStop() end
+
+    sp_bossEnabled = true
+    sp_bossThread = task.spawn(function()
+        while sp_bossEnabled do
+            local hum = safeGetHumanoid(safeGetCharacter())
+            if not hum or hum.Health <= 0 then
+                sp_currentMob = nil
+                task.wait(1)
+            else
+                local boss, bossHum = spFindBoss(sp_bossRootName)
+                if not boss then
+                    sp_currentMob = nil
+                    notify("Босс '" .. sp_bossRootName .. "' не найден — жду 4с", 2)
+                    local w = 0
+                    while sp_bossEnabled and w < 4 do
+                        task.wait(0.25); w = w + 0.25
+                    end
+                else
+                    sp_currentMob = boss
+                    if not godModeEnabled then
+                        local p = spModelPos(boss)
+                        if p then
+                            spSmoothTeleportTo(CFrame.lookAt(
+                                p + Vector3.new(0, sp_hoverHeight, 0), p))
+                        end
+                    end
+
+                    local skillKeys = spActiveSkillKeys()
+                    local skillIdx, lastSkill = 1, tick()
+
+                    while sp_bossEnabled
+                        and boss.Parent
+                        and bossHum and bossHum.Health > 0
+                    do
+                        spHoverAbove(boss)
+                        spMouseClick()
+                        if #skillKeys > 0 and (tick() - lastSkill) >= sp_skillDelay then
+                            spPressKey(skillKeys[skillIdx])
+                            skillIdx = (skillIdx % #skillKeys) + 1
+                            lastSkill = tick()
+                        end
+                        task.wait(sp_attackDelay)
+                    end
+                    sp_currentMob = nil
+                    task.wait(0.5)
+                end
+            end
+            task.wait(0.05)
+        end
+        sp_currentMob = nil
+        sp_bossThread = nil
+    end)
+end
+
+-- override placeholder
+spBossStop = function()
+    sp_bossEnabled = false
+    sp_currentMob = nil
+    sp_bossThread = nil
+end
+
+
+-- ====================================================
+-- GOD MODE v1: Noclip + hover (читает sp_currentMob)
+-- ====================================================
+local godConn
+-- Кэш BasePart'ов Character'а — обновляется только при ChildAdded/Removed,
+-- не итерируем GetChildren() каждый кадр (FPS-оптимизация).
+local godPartsCache = {}
+local godPartsConn  = {}
+
+local function godRebuildCache()
+    table.clear(godPartsCache)
+    for _, c in ipairs(godPartsConn) do
+        pcall(function() c:Disconnect() end)
+    end
+    table.clear(godPartsConn)
+
+    local char = safeGetCharacter()
+    if not char then return end
+    for _, p in ipairs(char:GetChildren()) do
+        if p:IsA("BasePart") then
+            table.insert(godPartsCache, p)
+        end
+    end
+    table.insert(godPartsConn, char.ChildAdded:Connect(function(c)
+        if c:IsA("BasePart") then
+            table.insert(godPartsCache, c)
+            if godModeEnabled then c.CanCollide = false end
+        end
+    end))
+    table.insert(godPartsConn, char.ChildRemoved:Connect(function(c)
+        for i = #godPartsCache, 1, -1 do
+            if godPartsCache[i] == c then
+                table.remove(godPartsCache, i)
+                break
+            end
+        end
+    end))
+end
+
+stopGodMode = function()
+    if godConn then godConn:Disconnect(); godConn = nil end
+    for _, c in ipairs(godPartsConn) do pcall(function() c:Disconnect() end) end
+    table.clear(godPartsConn)
+    -- Возвращаем коллизию
+    local char = safeGetCharacter()
+    if char then
+        for _, p in ipairs(char:GetChildren()) do
+            if p:IsA("BasePart") then
+                pcall(function() p.CanCollide = true end)
+            end
+        end
+    end
+    table.clear(godPartsCache)
+end
+
+local function startGodMode()
+    stopGodMode()
+    godRebuildCache()
+
+    godConn = RunService.Heartbeat:Connect(function()
+        if not godModeEnabled then
+            stopGodMode()
+            return
+        end
+        -- 1) Noclip — пишем CanCollide только если он реально true
+        for _, p in ipairs(godPartsCache) do
+            if p.CanCollide then p.CanCollide = false end
+        end
+        -- 2) Hover над целью
+        local mob = sp_currentMob
+        if mob and mob.Parent then
+            local char = safeGetCharacter()
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            local mobHead = mob:FindFirstChild("Head")
+                or mob:FindFirstChild("HumanoidRootPart") or mob.PrimaryPart
+            if hrp and mobHead then
+                local headPos = mobHead.Position
+                local eye = headPos + Vector3.new(0, sp_hoverHeight, 0)
+                hrp.CFrame = CFrame.lookAt(eye, headPos)
+                hrp.AssemblyLinearVelocity = Vector3.zero
+            end
+        end
+    end)
+    track(godConn)
+end
+
+-- Пересоздаём кэш при респавне
+track(LocalPlayer.CharacterAdded:Connect(function(_)
+    if godModeEnabled then
+        task.wait(0.4)
+        godRebuildCache()
+    end
+end))
+
+-- ====================================================
+-- GOD MODE v2: Health-restore + Dead-state block
+-- ====================================================
+-- Идея: пока v2 включен, мы каждый Heartbeat ставим Health = MaxHealth обратно
+-- (если игра пишет Health на клиенте, это работает). Дополнительно:
+--   * блокируем переход в HumanoidStateType.Dead через :SetStateEnabled
+--   * слушаем HealthChanged и сразу восстанавливаем
+-- Не панацея против серверной валидации HP, но в Sailor Piece работает на
+-- большинстве боссов кроме тех, где HP считается RemoteEvent'ом сервера.
+local god2Conn
+local god2HealthConn
+local god2StateConn
+local god2BoundHum
+
+local function _god2Detach()
+    if god2Conn then god2Conn:Disconnect(); god2Conn = nil end
+    if god2HealthConn then god2HealthConn:Disconnect(); god2HealthConn = nil end
+    if god2StateConn then god2StateConn:Disconnect(); god2StateConn = nil end
+    if god2BoundHum then
+        pcall(function()
+            god2BoundHum:SetStateEnabled(Enum.HumanoidStateType.Dead, true)
+            god2BoundHum.BreakJointsOnDeath = true
+        end)
+    end
+    god2BoundHum = nil
+end
+
+local function _god2Bind(hum)
+    if not hum then return end
+    god2BoundHum = hum
+    pcall(function()
+        hum:SetStateEnabled(Enum.HumanoidStateType.Dead, false)
+        hum.BreakJointsOnDeath = false
+    end)
+    god2HealthConn = hum.HealthChanged:Connect(function(h)
+        if not godMode2Enabled then return end
+        if h < hum.MaxHealth then
+            hum.Health = hum.MaxHealth
+        end
+    end)
+    god2StateConn = hum.StateChanged:Connect(function(_, new)
+        if not godMode2Enabled then return end
+        if new == Enum.HumanoidStateType.Dead
+            or new == Enum.HumanoidStateType.Ragdoll
+            or new == Enum.HumanoidStateType.FallingDown
+        then
+            hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+            hum.Health = hum.MaxHealth
+        end
+    end)
+end
+
+stopGodMode2 = function()
+    _god2Detach()
+end
+
+local function startGodMode2()
+    stopGodMode2()
+    local function bindCurrent()
+        local hum = safeGetHumanoid(safeGetCharacter())
+        if hum then _god2Bind(hum) end
+    end
+    bindCurrent()
+
+    -- Каждые 0.1с подтягиваем Health (без Heartbeat, чтобы не съедать FPS)
+    god2Conn = task.spawn(function()
+        while godMode2Enabled do
+            local hum = safeGetHumanoid(safeGetCharacter())
+            if hum and hum.Health < hum.MaxHealth then
+                hum.Health = hum.MaxHealth
+            end
+            task.wait(0.1)
+        end
+    end)
+    -- god2Conn здесь — не RBXScriptConnection, а корутина; сам остановится по флагу
+end
+
+-- ребайнд при респавне
+track(LocalPlayer.CharacterAdded:Connect(function(_)
+    if godMode2Enabled then
+        task.wait(0.5)
+        local hum = safeGetHumanoid(safeGetCharacter())
+        if hum then
+            _god2Detach()   -- очищаем старые конны (они на старом Humanoid)
+            _god2Bind(hum)
+        end
+    end
+end))
+
+
+--========================================================
+-- SAILOR PIECE — UI
+--========================================================
+
+-- ===== Quest Setup =====
+local npcDropdown, mobDropdown
+
+npcDropdown = SailorTab:CreateDropdown({
+    Name = "Выбранный NPC",
+    Options = sp_npcChoices,
+    CurrentOption = { sp_npcChoices[1] },
+    MultipleOptions = false,
+    Flag = "sp_questNpc",
+    Callback = function(opt)
+        local v = (type(opt) == "table") and opt[1] or opt
+        if v and not _isPlaceholder(v) then
+            sp_questNpcName = v
+        end
+    end
+})
+
+mobDropdown = SailorTab:CreateDropdown({
+    Name = "Выбранный Моб",
+    Options = sp_mobChoices,
+    CurrentOption = { sp_mobChoices[1] },
+    MultipleOptions = false,
+    Flag = "sp_mob",
+    Callback = function(opt)
+        local v = (type(opt) == "table") and opt[1] or opt
+        if v and not _isPlaceholder(v) then
+            sp_mobBaseName = v
+        end
+    end
+})
+
+SailorTab:CreateButton({
+    Name = "Scan Area NPCs",
+    Callback = function()
+        sp_npcChoices = spScanAreaNpcs()
+        if npcDropdown and npcDropdown.Refresh then
+            pcall(npcDropdown.Refresh, npcDropdown, sp_npcChoices)
+        end
+        notify(("Найдено NPC: %d"):format(#sp_npcChoices))
+    end
+})
+
+SailorTab:CreateButton({
+    Name = "Scan Area Mobs",
+    Callback = function()
+        sp_mobChoices = spScanAreaMobs()
+        if mobDropdown and mobDropdown.Refresh then
+            pcall(mobDropdown.Refresh, mobDropdown, sp_mobChoices)
+        end
+        notify(("Найдено мобов: %d"):format(#sp_mobChoices))
+    end
+})
+
+SailorTab:CreateSlider({
+    Name = "Scan Radius",
+    Range = { 30, 500 },
+    Increment = 10,
+    Suffix = "ст.",
+    CurrentValue = sp_scanRadius,
+    Flag = "sp_scanRadius",
+    Callback = function(v) sp_scanRadius = v end
+})
+
+SailorTab:CreateSlider({
+    Name = "Search Radius (Hunt)",
+    Range = { 50, 1000 },
+    Increment = 25,
+    Suffix = "ст.",
+    CurrentValue = sp_searchRadius,
+    Flag = "sp_searchRadius",
+    Callback = function(v) sp_searchRadius = v end
+})
+
+SailorTab:CreateSlider({
+    Name = "Hunt Duration",
+    Range = { 15, 300 },
+    Increment = 5,
+    Suffix = "с",
+    CurrentValue = sp_huntDuration,
+    Flag = "sp_huntDuration",
+    Callback = function(v) sp_huntDuration = v end
+})
+
+SailorTab:CreateSlider({
+    Name = "Hover Height",
+    Range = { 3, 20 },
+    Increment = 1,
+    Suffix = "ст.",
+    CurrentValue = sp_hoverHeight,
+    Flag = "sp_hoverHeight",
+    Callback = function(v) sp_hoverHeight = v end
+})
+
+-- ===== Combat =====
+local SCombatSec = SailorTab:CreateSection("Combat")
+
+SailorTab:CreateSlider({
+    Name = "Weapon Slot",
+    Range = { 1, 5 },
+    Increment = 1,
+    Suffix = "",
+    CurrentValue = sp_weaponSlot,
+    Flag = "sp_weaponSlot",
+    Callback = function(v)
+        sp_weaponSlot = v
+        spSelectSlot(v)   -- сразу же экипируем
+    end
+})
+
+SailorTab:CreateToggle({
+    Name = "Auto Equip Slot on Spawn",
+    CurrentValue = sp_autoEquip,
+    Flag = "sp_autoEquip",
+    Callback = function(v) sp_autoEquip = v end
+})
+
+SailorTab:CreateButton({
+    Name = "Equip Slot Now",
+    Callback = function() spSelectSlot(sp_weaponSlot) end
+})
+
+SailorTab:CreateToggle({
+    Name = "Hand Fight (mouse clicks)",
+    CurrentValue = not sp_handFightOff,
+    Flag = "sp_handFight",
+    Callback = function(v) sp_handFightOff = not v end
+})
+
+SailorTab:CreateToggle({
+    Name = "Require Tool to Click",
+    CurrentValue = sp_useHandsOnly,
+    Flag = "sp_requireTool",
+    Callback = function(v) sp_useHandsOnly = v end
+})
+
+SailorTab:CreateSlider({
+    Name = "Attack Delay",
+    Range = { 0.15, 1.0 },
+    Increment = 0.05,
+    Suffix = "с",
+    CurrentValue = sp_attackDelay,
+    Flag = "sp_attackDelay",
+    Callback = function(v) sp_attackDelay = v end
+})
+
+SailorTab:CreateSlider({
+    Name = "Skill Delay (between)",
+    Range = { 0.3, 5.0 },
+    Increment = 0.1,
+    Suffix = "с",
+    CurrentValue = sp_skillDelay,
+    Flag = "sp_skillDelay",
+    Callback = function(v) sp_skillDelay = v end
+})
+
+SailorTab:CreateSlider({
+    Name = "Skill Hold",
+    Range = { 0.05, 0.5 },
+    Increment = 0.05,
+    Suffix = "с",
+    CurrentValue = sp_skillHold,
+    Flag = "sp_skillHold",
+    Callback = function(v) sp_skillHold = v end
+})
+
+-- Скиллы (тогглы Z/X/C/V/F общие для квестов и боссов)
+SailorTab:CreateToggle({ Name = "Use Z", CurrentValue = sp_useZ, Flag = "sp_useZ", Callback = function(v) sp_useZ = v end })
+SailorTab:CreateToggle({ Name = "Use X", CurrentValue = sp_useX, Flag = "sp_useX", Callback = function(v) sp_useX = v end })
+SailorTab:CreateToggle({ Name = "Use C", CurrentValue = sp_useC, Flag = "sp_useC", Callback = function(v) sp_useC = v end })
+SailorTab:CreateToggle({ Name = "Use V", CurrentValue = sp_useV, Flag = "sp_useV", Callback = function(v) sp_useV = v end })
+SailorTab:CreateToggle({ Name = "Use F", CurrentValue = sp_useF, Flag = "sp_useF", Callback = function(v) sp_useF = v end })
+
+-- ===== God Mode =====
+local SGodSec = SailorTab:CreateSection("God Mode")
+
+SailorTab:CreateToggle({
+    Name = "God Mode v1 (Noclip + Hover 7s)",
+    CurrentValue = false,
+    Flag = "godModeV1",
+    Callback = function(v)
+        godModeEnabled = v
+        if v then startGodMode() else stopGodMode() end
+    end
+})
+
+SailorTab:CreateToggle({
+    Name = "God Mode v2 (HP-restore + Dead-block)",
+    CurrentValue = false,
+    Flag = "godModeV2",
+    Callback = function(v)
+        godMode2Enabled = v
+        if v then startGodMode2() else stopGodMode2() end
+    end
+})
+
+SailorTab:CreateParagraph({
+    Title = "О God Mode",
+    Content = "v1 — клиентский noclip + парение над целью (работает против melee/AOE боссов).\n" ..
+              "v2 — постоянное восстановление HP + блок Dead-state (полезно когда игра доверяет клиенту HP).\n" ..
+              "Можно включать оба одновременно для максимальной защиты."
+})
+
+-- ===== Run =====
+local SRunSec = SailorTab:CreateSection("Run")
+
+SailorTab:CreateToggle({
+    Name = "Auto Farm (Quest)",
+    CurrentValue = false,
+    Flag = "sp_autoFarm",
+    Callback = function(v)
+        if v then spStart() else spStop() end
+    end
+})
+
+SailorTab:CreateButton({
+    Name = "Take Quest Now",
+    Callback = function()
+        task.spawn(function()
+            _sp_forcedTp = true
+            local npc = spFindQuestNpc(sp_questNpcName)
+            if npc then spTakeQuestFrom(npc) else notify("NPC не найден") end
+            _sp_forcedTp = false
+        end)
+    end
+})
+
+SailorTab:CreateButton({
+    Name = "TP To Mob",
+    Callback = function()
+        task.spawn(function()
+            _sp_forcedTp = true
+            local mob = spFindMob(sp_mobBaseName)
+            if mob then
+                local p = spModelPos(mob)
+                if p then
+                    spSmoothTeleportTo(CFrame.lookAt(
+                        p + Vector3.new(0, sp_hoverHeight, 0), p))
+                end
+            else notify("Моб не найден") end
+            _sp_forcedTp = false
+        end)
+    end
+})
+
+SailorTab:CreateButton({
+    Name = "Force: TakeQuest",
+    Callback = function() _G.QuestState = "TakeQuest" end
+})
+SailorTab:CreateButton({
+    Name = "Force: Hunting",
+    Callback = function() _G.QuestState = "Hunting" end
+})
+
+-- ===== Raid Bosses =====
+local SBossSec = SailorTab:CreateSection("Raid Bosses")
+
+SailorTab:CreateDropdown({
+    Name = "Рейдовые Боссы",
+    Options = EliteBossOrder,
+    CurrentOption = { sp_bossDisplayName },
+    MultipleOptions = false,
+    Flag = "sp_bossPick",
+    Callback = function(opt)
+        local v = (type(opt) == "table") and opt[1] or opt
+        if v and EliteBosses[v] then
+            sp_bossDisplayName = v
+            sp_bossRootName    = EliteBosses[v]
+        end
+    end
+})
+
+SailorTab:CreateToggle({
+    Name = "Auto Farm Selected Boss",
+    CurrentValue = false,
+    Flag = "sp_bossFarm",
+    Callback = function(v)
+        if v then spBossStart() else spBossStop() end
+    end
+})
+
+SailorTab:CreateParagraph({
+    Title = "Подсказка",
+    Content = "Имя ищется через string.find — ловит любой суффикс сложности (_Normal, _Medium, _Hard, _Extreme и т.д.). Скиллы (Z/X/C/V/F) и слот оружия общие с квест-фармом."
+})
+
+
+--========================================================
+-- COMBAT TAB (Aimbot + TP Behind)
+--========================================================
+local CombatSec = CombatTab:CreateSection("Aimbot")
+
+local aimbotEnabled = false
+local aimbotKey  = Enum.UserInputType.MouseButton2
+local aimbotFov  = 40
+local aimbotSmooth = 0.25
+local aimbotTarget
+local teamCheck = false
+local aimbotConn
+
+local function getTargetPart(char)
+    return char and (char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart"))
+end
+
+local function findClosestEnemy(requireFov, maxAngleDeg)
+    local myHRP = safeGetHRP(safeGetCharacter())
+    if not myHRP then return nil end
+    local camCF = Camera.CFrame
+    local cosLimit = requireFov and math.cos(math.rad(maxAngleDeg or 30)) or -2
+    local best, bestScore = nil, math.huge
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= LocalPlayer and not (teamCheck and isSameTeam(plr)) then
+            local char = plr.Character
+            local hum  = char and char:FindFirstChildOfClass("Humanoid")
+            local part = getTargetPart(char)
+            if part and hum and hum.Health > 0 then
+                local toT = part.Position - camCF.Position
+                local d = toT.Magnitude
+                if d > 0 then
+                    local cosAng = (toT.Unit):Dot(camCF.LookVector)
+                    if cosAng >= cosLimit and d < bestScore then
+                        bestScore, best = d, plr
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function stopAimbot()
+    if aimbotConn then aimbotConn:Disconnect(); aimbotConn = nil end
+    aimbotTarget = nil
+end
+
+local function startAimbot()
+    if aimbotConn then return end
+    aimbotConn = RunService.RenderStepped:Connect(function()
+        if not aimbotEnabled then stopAimbot(); return end
+        local pressing = UIS:IsMouseButtonPressed(aimbotKey)
+            or (aimbotKey.EnumType == Enum.KeyCode and UIS:IsKeyDown(aimbotKey))
+        if not pressing then aimbotTarget = nil; return end
+        if not aimbotTarget or not aimbotTarget.Character then
+            aimbotTarget = findClosestEnemy(true, aimbotFov)
+        end
+        if not aimbotTarget then return end
+        local part = getTargetPart(aimbotTarget.Character)
+        if not part then return end
+        Camera.CFrame = Camera.CFrame:Lerp(
+            CFrame.lookAt(Camera.CFrame.Position, part.Position),
+            math.clamp(aimbotSmooth, 0.05, 1))
+    end)
+    track(aimbotConn)
+end
+
+CombatTab:CreateToggle({
+    Name = "Aimbot",
+    CurrentValue = false,
+    Flag = "aimbotEnabled",
+    Callback = function(v)
+        aimbotEnabled = v
+        if v then startAimbot() else stopAimbot() end
+    end
+})
+CombatTab:CreateSlider({
+    Name = "Aimbot FOV", Range = { 5, 180 }, Increment = 1, Suffix = "°",
+    CurrentValue = aimbotFov, Flag = "aimbotFov",
+    Callback = function(v) aimbotFov = v end
+})
+CombatTab:CreateSlider({
+    Name = "Aimbot Smooth", Range = { 0.05, 1 }, Increment = 0.05, Suffix = "",
+    CurrentValue = aimbotSmooth, Flag = "aimbotSmooth",
+    Callback = function(v) aimbotSmooth = v end
+})
+CombatTab:CreateDropdown({
+    Name = "Aimbot Key",
+    Options = { "RMB", "LMB", "E", "Q", "F" },
+    CurrentOption = { "RMB" },
+    Flag = "aimbotKeyPick",
+    Callback = function(opt)
+        local v = (type(opt) == "table") and opt[1] or opt
+        local map = {
+            RMB = Enum.UserInputType.MouseButton2, LMB = Enum.UserInputType.MouseButton1,
+            E = Enum.KeyCode.E, Q = Enum.KeyCode.Q, F = Enum.KeyCode.F
+        }
+        aimbotKey = map[v] or Enum.UserInputType.MouseButton2
+    end
+})
+CombatTab:CreateToggle({
+    Name = "Team Check",
+    CurrentValue = false, Flag = "teamCheck",
+    Callback = function(v) teamCheck = v end
+})
+
+local TPSec = CombatTab:CreateSection("TP / Misc")
+local selectedPlayerName
+
+CombatTab:CreateButton({
+    Name = "TP Behind Closest Enemy",
+    Callback = function()
+        local t = findClosestEnemy(false, nil)
+        if not t then notify("Врагов нет"); return end
+        local thrp = t.Character and t.Character:FindFirstChild("HumanoidRootPart")
+        local mhrp = safeGetHRP(safeGetCharacter())
+        if thrp and mhrp then
+            mhrp.CFrame = thrp.CFrame * CFrame.new(0, 0, 3)
+        end
+    end
+})
+
+local function getPlayerNameList()
+    local t = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p ~= LocalPlayer then table.insert(t, p.Name) end
+    end
+    if #t == 0 then table.insert(t, "(нет игроков)") end
+    return t
+end
+
+local tpDropdown
+tpDropdown = CombatTab:CreateDropdown({
+    Name = "Target Player",
+    Options = getPlayerNameList(),
+    CurrentOption = { (Players:GetPlayers()[2] and Players:GetPlayers()[2].Name) or "(нет игроков)" },
+    Flag = "tpTarget",
+    Callback = function(opt)
+        local v = (type(opt) == "table") and opt[1] or opt
+        selectedPlayerName = v
+    end
+})
+local function refreshTpDropdown()
+    if tpDropdown and tpDropdown.Refresh then
+        pcall(tpDropdown.Refresh, tpDropdown, getPlayerNameList())
+    end
+end
+track(Players.PlayerAdded:Connect(refreshTpDropdown))
+track(Players.PlayerRemoving:Connect(refreshTpDropdown))
+
+CombatTab:CreateButton({
+    Name = "Refresh Players",
+    Callback = function() refreshTpDropdown() end
+})
+CombatTab:CreateButton({
+    Name = "TP To Selected",
+    Callback = function()
+        if not selectedPlayerName or _isPlaceholder(selectedPlayerName) then return end
+        local t = Players:FindFirstChild(selectedPlayerName)
+        if t and t.Character then
+            local thrp = t.Character:FindFirstChild("HumanoidRootPart")
+            local mhrp = safeGetHRP(safeGetCharacter())
+            if thrp and mhrp then
+                mhrp.CFrame = thrp.CFrame * CFrame.new(0, 0, 3)
+            end
+        end
+    end
+})
+
+
+--========================================================
+-- PLAYER TAB
+--========================================================
+local PMoveSec = PlayerTab:CreateSection("Movement")
+
+-- Fly
+local flyEnabled, flyConn = false, nil
+local function stopFly()
+    if flyConn then flyConn:Disconnect(); flyConn = nil end
+    local h = safeGetHumanoid(safeGetCharacter())
+    if h then h.PlatformStand = false end
+end
+local function startFly()
+    stopFly()
+    flyConn = RunService.Heartbeat:Connect(function()
+        if not flyEnabled then stopFly(); return end
+        local char = safeGetCharacter()
+        local hum, hrp = safeGetHumanoid(char), safeGetHRP(char)
+        if not (hum and hrp) then return end
+        hum.PlatformStand = true
+        local d = Vector3.zero
+        if UIS:IsKeyDown(Enum.KeyCode.W) then d = d + Camera.CFrame.LookVector end
+        if UIS:IsKeyDown(Enum.KeyCode.S) then d = d - Camera.CFrame.LookVector end
+        if UIS:IsKeyDown(Enum.KeyCode.A) then d = d - Camera.CFrame.RightVector end
+        if UIS:IsKeyDown(Enum.KeyCode.D) then d = d + Camera.CFrame.RightVector end
+        if UIS:IsKeyDown(Enum.KeyCode.Space) then d = d + Vector3.yAxis end
+        if UIS:IsKeyDown(Enum.KeyCode.LeftControl) then d = d - Vector3.yAxis end
+        hrp.Velocity = d.Magnitude > 0 and (d.Unit * 100) or Vector3.zero
+    end)
+    track(flyConn)
+end
+
+PlayerTab:CreateToggle({
+    Name = "Fly (RISKY)", CurrentValue = false, Flag = "flyEnabled",
+    Callback = function(v)
+        flyEnabled = v
+        if v then startFly() else stopFly() end
+    end
+})
+
+-- Infinite Jump
+local infJump, jumpConn = false, nil
+local function stopInfJump() if jumpConn then jumpConn:Disconnect(); jumpConn = nil end end
+local function bindInfJump(hum)
+    if not hum then return end
+    stopInfJump()
+    jumpConn = hum.StateChanged:Connect(function(_, s)
+        if not infJump then stopInfJump(); return end
+        if s == Enum.HumanoidStateType.Landed then
+            hum:ChangeState(Enum.HumanoidStateType.Jumping)
+        end
+    end)
+    track(jumpConn)
+end
+track(LocalPlayer.CharacterAdded:Connect(function(c)
+    if infJump then bindInfJump(c:WaitForChild("Humanoid", 5)) end
+end))
+PlayerTab:CreateToggle({
+    Name = "Infinite Jump", CurrentValue = false, Flag = "infJump",
+    Callback = function(v)
+        infJump = v
+        if v then bindInfJump(safeGetHumanoid(safeGetCharacter())) else stopInfJump() end
+    end
+})
+
+-- Noclip (общий)
+local noClip, noClipConn = false, nil
+local function stopNoClip()
+    if noClipConn then noClipConn:Disconnect(); noClipConn = nil end
+    local c = safeGetCharacter()
+    if c then for _, p in ipairs(c:GetDescendants()) do
+        if p:IsA("BasePart") then p.CanCollide = true end
+    end end
+end
+PlayerTab:CreateToggle({
+    Name = "No Clip", CurrentValue = false, Flag = "noClip",
+    Callback = function(v)
+        noClip = v
+        if v then
+            stopNoClip()
+            noClipConn = RunService.Stepped:Connect(function()
+                if not noClip then stopNoClip(); return end
+                local c = safeGetCharacter()
+                if not c then return end
+                for _, p in ipairs(c:GetDescendants()) do
+                    if p:IsA("BasePart") and p.CanCollide then p.CanCollide = false end
+                end
+            end)
+            track(noClipConn)
+        else stopNoClip() end
+    end
+})
+
+PlayerTab:CreateSlider({
+    Name = "Walk Speed", Range = { 16, 500 }, Increment = 1, Suffix = "",
+    CurrentValue = 16, Flag = "walkSpeed",
+    Callback = function(v)
+        local h = safeGetHumanoid(safeGetCharacter())
+        if h then h.WalkSpeed = v end
+    end
+})
+PlayerTab:CreateSlider({
+    Name = "Jump Power", Range = { 50, 500 }, Increment = 5, Suffix = "",
+    CurrentValue = 50, Flag = "jumpPower",
+    Callback = function(v)
+        local h = safeGetHumanoid(safeGetCharacter())
+        if h then h.JumpPower = v end
+    end
+})
+
+-- Anti-AFK
+local antiAfk = false
+PlayerTab:CreateToggle({
+    Name = "Anti AFK", CurrentValue = false, Flag = "antiAfk",
+    Callback = function(v) antiAfk = v end
+})
+pcall(function()
+    track(LocalPlayer.Idled:Connect(function()
+        if not antiAfk then return end
+        local vu = game:GetService("VirtualUser")
+        pcall(function()
+            vu:CaptureController()
+            vu:ClickButton2(Vector2.new())
+        end)
+    end))
+end)
+
+--========================================================
+-- VISUALS TAB
+--========================================================
+VisualsTab:CreateToggle({
+    Name = "No Fog", CurrentValue = false, Flag = "noFog",
+    Callback = function(v)
+        if v then Lighting.FogEnd = 99999; Lighting.FogStart = 0
+        else Lighting.FogEnd = 1000; Lighting.FogStart = 0 end
+    end
+})
+VisualsTab:CreateToggle({
+    Name = "Full Bright", CurrentValue = false, Flag = "fullBright",
+    Callback = function(v)
+        if v then
+            Lighting.Brightness = 10
+            Lighting.Ambient = Color3.new(1, 1, 1)
+            Lighting.OutdoorAmbient = Color3.new(1, 1, 1)
+        else
+            Lighting.Brightness = 3
+            Lighting.Ambient = Color3.new(0.5, 0.5, 0.5)
+            Lighting.OutdoorAmbient = Color3.new(0.5, 0.5, 0.5)
+        end
+    end
+})
+VisualsTab:CreateToggle({
+    Name = "No Sky", CurrentValue = false, Flag = "noSky",
+    Callback = function(v) Lighting.SkyboxEnabled = not v end
+})
+
+--========================================================
+-- WORLD TAB
+--========================================================
+WorldTab:CreateSlider({
+    Name = "Gravity", Range = { 0, 500 }, Increment = 5, Suffix = "",
+    CurrentValue = 196, Flag = "gravity",
+    Callback = function(v) workspace.Gravity = v end
+})
+WorldTab:CreateSlider({
+    Name = "Time of Day", Range = { 0, 24 }, Increment = 1, Suffix = "h",
+    CurrentValue = 14, Flag = "tod",
+    Callback = function(v) Lighting.ClockTime = v end
+})
+
+
+--========================================================
+-- ESP SYSTEM (один RenderStepped, кэш на всех игроков)
+--========================================================
+local espEnabled, boxESP, tracerESP, nameESP, healthESP = false, false, false, false, false
+local renderDistance = 1000
+local espColor = Color3.fromRGB(0, 255, 0)
+local espTeamCheck = false
+
+local ESP = {}
+
+local visParams = RaycastParams.new()
+visParams.FilterType = Enum.RaycastFilterType.Exclude
+visParams.IgnoreWater = true
+
+local function refreshIgnoreList()
+    local list = {}
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p.Character then table.insert(list, p.Character) end
+    end
+    visParams.FilterDescendantsInstances = list
+end
+refreshIgnoreList()
+track(Players.PlayerAdded:Connect(function(p)
+    track(p.CharacterAdded:Connect(refreshIgnoreList))
+end))
+for _, p in ipairs(Players:GetPlayers()) do
+    track(p.CharacterAdded:Connect(refreshIgnoreList))
+end
+
+local tracerGui = Instance.new("ScreenGui")
+tracerGui.Name = randomName()
+tracerGui.IgnoreGuiInset = true
+tracerGui.ResetOnSpawn = false
+pcall(function()
+    tracerGui.Parent = hiddenParent
+    if syn and syn.protect_gui then syn.protect_gui(tracerGui) end
+end)
+_G.LunaTracerGui = tracerGui
+
+local function clearESP(plr)
+    local d = ESP[plr]
+    if not d then return end
+    if d.root then d.root:Destroy() end
+    if d.tracer then d.tracer:Destroy() end
+    ESP[plr] = nil
+    refreshIgnoreList()
+end
+
+local function buildESP(plr)
+    if plr == LocalPlayer or ESP[plr] then return end
+    local root = Instance.new("Frame")
+    root.Name = randomName()
+    root.BackgroundTransparency = 1
+    root.Size = UDim2.fromScale(1, 1)
+    root.Visible = false
+    root.Parent = tracerGui
+
+    local function makeLine()
+        local f = Instance.new("Frame")
+        f.Name = randomName()
+        f.BackgroundColor3 = espColor
+        f.BorderSizePixel = 0
+        f.AnchorPoint = Vector2.new(0.5, 0.5)
+        f.Size = UDim2.new(0, 0, 0, 0)
+        f.Visible = false
+        f.Parent = root
+        return f
+    end
+    local boxTop, boxBottom, boxLeft, boxRight = makeLine(), makeLine(), makeLine(), makeLine()
+
+    local nameLabel = Instance.new("TextLabel")
+    nameLabel.Name = randomName()
+    nameLabel.BackgroundTransparency = 1
+    nameLabel.AnchorPoint = Vector2.new(0.5, 1)
+    nameLabel.Size = UDim2.new(0, 200, 0, 18)
+    nameLabel.Font = Enum.Font.GothamBold
+    nameLabel.TextSize = 13
+    nameLabel.TextStrokeTransparency = 0
+    nameLabel.TextColor3 = espColor
+    nameLabel.Text = ""
+    nameLabel.Visible = false
+    nameLabel.Parent = root
+
+    local hpBg = Instance.new("Frame")
+    hpBg.Name = randomName()
+    hpBg.AnchorPoint = Vector2.new(1, 0.5)
+    hpBg.BackgroundColor3 = Color3.new(0, 0, 0)
+    hpBg.BorderSizePixel = 0
+    hpBg.Size = UDim2.new(0, 3, 0, 0)
+    hpBg.Visible = false
+    hpBg.Parent = root
+    local hpFill = Instance.new("Frame")
+    hpFill.Name = randomName()
+    hpFill.AnchorPoint = Vector2.new(0, 1)
+    hpFill.Position = UDim2.new(0, 0, 1, 0)
+    hpFill.BackgroundColor3 = Color3.fromRGB(0, 255, 0)
+    hpFill.BorderSizePixel = 0
+    hpFill.Size = UDim2.new(1, 0, 1, 0)
+    hpFill.Parent = hpBg
+
+    local tracer = Instance.new("Frame")
+    tracer.Name = randomName()
+    tracer.BackgroundColor3 = espColor
+    tracer.BorderSizePixel = 0
+    tracer.AnchorPoint = Vector2.new(0.5, 0.5)
+    tracer.Size = UDim2.new(0, 0, 0, 2)
+    tracer.Visible = false
+    tracer.Parent = tracerGui
+
+    ESP[plr] = {
+        root = root, boxTop = boxTop, boxBottom = boxBottom, boxLeft = boxLeft, boxRight = boxRight,
+        tracer = tracer, nameLabel = nameLabel, hpBg = hpBg, hpFill = hpFill,
+        visible = false, nextVisCheck = tick() + math.random() * 0.1,
+    }
+end
+
+local espRenderConn
+local function hideEspEntry(d)
+    if d.root.Visible then d.root.Visible = false end
+    if d.tracer.Visible then d.tracer.Visible = false end
+end
+
+local function startEspLoop()
+    if espRenderConn then return end
+    espRenderConn = RunService.RenderStepped:Connect(function()
+        if not espEnabled or not (boxESP or nameESP or healthESP or tracerESP) then
+            for _, d in pairs(ESP) do hideEspEntry(d) end
+            return
+        end
+        local camCF = Camera.CFrame
+        local camPos = camCF.Position
+        local vp = Camera.ViewportSize
+        local vpHalfX, vpY = vp.X * 0.5, vp.Y
+        local maxSq = renderDistance * renderDistance
+        local now = tick()
+
+        for plr, d in pairs(ESP) do
+            local char = plr.Character
+            local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+            local hum  = char and char:FindFirstChild("Humanoid")
+            if not hrp or not hum or hum.Health <= 0 or (espTeamCheck and isSameTeam(plr)) then
+                hideEspEntry(d)
+            else
+                local hrpPos = hrp.Position
+                local dx, dy, dz = hrpPos.X - camPos.X, hrpPos.Y - camPos.Y, hrpPos.Z - camPos.Z
+                local distSq = dx*dx + dy*dy + dz*dz
+                if distSq > maxSq then hideEspEntry(d)
+                else
+                    local dist = math.sqrt(distSq)
+                    if now >= d.nextVisCheck then
+                        d.nextVisCheck = now + 0.1
+                        local rayOk, rayRes = pcall(workspace.Raycast, workspace,
+                            camPos, hrpPos - camPos, visParams)
+                        d.visible = rayOk and (rayRes == nil)
+                    end
+                    local isVisible = d.visible
+                    local sp_, onScreen = Camera:WorldToViewportPoint(hrpPos)
+                    local sx, sy, sz = sp_.X, sp_.Y, sp_.Z
+                    local visibleOnScreen = onScreen and sz > 0
+                    local h, w, halfW, halfH
+                    if visibleOnScreen then
+                        h = math.clamp(2000 / sz, 20, 400)
+                        w = h * 0.55
+                        halfW, halfH = w * 0.5, h * 0.5
+                    end
+                    local anyOnScreen = visibleOnScreen and (boxESP or nameESP or healthESP)
+                    local showTracer = tracerESP
+                    if not (anyOnScreen or showTracer) then hideEspEntry(d)
+                    else
+                        d.root.Visible = anyOnScreen or showTracer
+                        local alphaOff = isVisible and 0 or 0.55
+                        local showBox = boxESP and visibleOnScreen
+                        if showBox then
+                            local thick = 1
+                            d.boxTop.Position = UDim2.new(0, sx, 0, sy - halfH); d.boxTop.Size = UDim2.new(0, w, 0, thick)
+                            d.boxBottom.Position = UDim2.new(0, sx, 0, sy + halfH); d.boxBottom.Size = UDim2.new(0, w, 0, thick)
+                            d.boxLeft.Position = UDim2.new(0, sx - halfW, 0, sy); d.boxLeft.Size = UDim2.new(0, thick, 0, h)
+                            d.boxRight.Position = UDim2.new(0, sx + halfW, 0, sy); d.boxRight.Size = UDim2.new(0, thick, 0, h)
+                            for _, l in ipairs({d.boxTop, d.boxBottom, d.boxLeft, d.boxRight}) do
+                                l.BackgroundColor3 = espColor; l.BackgroundTransparency = alphaOff; l.Visible = true
+                            end
+                        else
+                            d.boxTop.Visible = false; d.boxBottom.Visible = false; d.boxLeft.Visible = false; d.boxRight.Visible = false
+                        end
+                        if nameESP and visibleOnScreen then
+                            local topY = showBox and (sy - halfH - 4) or (sy - math.clamp(2000/sz, 20, 400)*0.5 - 4)
+                            d.nameLabel.Text = ("%s [%s] [%dm]"):format(plr.Name, isVisible and "VIS" or "HID", math.floor(dist))
+                            d.nameLabel.Position = UDim2.new(0, sx, 0, topY)
+                            d.nameLabel.TextColor3 = isVisible and espColor or Color3.fromRGB(180, 180, 180)
+                            d.nameLabel.TextTransparency = isVisible and 0 or 0.2
+                            d.nameLabel.Visible = true
+                        else d.nameLabel.Visible = false end
+                        if healthESP and visibleOnScreen then
+                            local pct = math.clamp(hum.Health / math.max(hum.MaxHealth, 1), 0, 1)
+                            local barH = showBox and h or math.clamp(2000/sz, 20, 400)
+                            local barX = showBox and (sx - halfW - 4) or (sx - barH * 0.55 * 0.5 - 4)
+                            d.hpBg.Position = UDim2.new(0, barX, 0, sy)
+                            d.hpBg.Size = UDim2.new(0, 3, 0, barH)
+                            d.hpBg.BackgroundTransparency = isVisible and 0 or 0.4
+                            d.hpBg.Visible = true
+                            d.hpFill.Size = UDim2.new(1, 0, pct, 0)
+                            d.hpFill.BackgroundColor3 = (pct < 0.3 and Color3.fromRGB(255, 50, 50))
+                                or (pct < 0.6 and Color3.fromRGB(255, 220, 50)) or Color3.fromRGB(50, 255, 50)
+                        else d.hpBg.Visible = false end
+                        if showTracer then
+                            local tsx, tsy = sx, sy
+                            if sz < 0 then
+                                tsx = vp.X - sx; tsy = vpY - sy
+                                local ddx, ddy = tsx - vpHalfX, tsy - vpY * 0.5
+                                local len2 = ddx*ddx + ddy*ddy
+                                if len2 > 0 then
+                                    local len = math.sqrt(len2)
+                                    tsx = vpHalfX + ddx/len * (vp.X * 0.6)
+                                    tsy = vpY * 0.5 + ddy/len * (vpY * 0.6)
+                                end
+                            end
+                            local m = 20
+                            if tsx < m then tsx = m elseif tsx > vp.X - m then tsx = vp.X - m end
+                            if tsy < m then tsy = m elseif tsy > vpY - m then tsy = vpY - m end
+                            local fromX, fromY = vpHalfX, vpY
+                            local diffX, diffY = tsx - fromX, tsy - fromY
+                            local length = math.sqrt(diffX*diffX + diffY*diffY)
+                            if length > 1 then
+                                d.tracer.Position = UDim2.new(0, fromX + diffX*0.5, 0, fromY + diffY*0.5)
+                                d.tracer.Size = UDim2.new(0, length, 0, 2)
+                                d.tracer.Rotation = math.deg(math.atan2(diffY, diffX))
+                                d.tracer.BackgroundColor3 = espColor
+                                d.tracer.BackgroundTransparency = isVisible and 0 or 0.45
+                                d.tracer.Visible = true
+                            else d.tracer.Visible = false end
+                        else d.tracer.Visible = false end
+                    end
+                end
+            end
+        end
+    end)
+    track(espRenderConn)
+end
+local function stopEspLoop()
+    if espRenderConn then espRenderConn:Disconnect(); espRenderConn = nil end
+end
+
+task.spawn(function()
+    pcall(function()
+        track(Players.PlayerAdded:Connect(buildESP))
+        track(Players.PlayerRemoving:Connect(clearESP))
+        for _, p in ipairs(Players:GetPlayers()) do buildESP(p) end
+        startEspLoop()
+    end)
+end)
+
+ESPTab:CreateToggle({ Name = "ESP Master", CurrentValue = false, Flag = "espMaster",
+    Callback = function(v) espEnabled = v end })
+ESPTab:CreateToggle({ Name = "Box ESP", CurrentValue = false, Flag = "espBox",
+    Callback = function(v) boxESP = v end })
+ESPTab:CreateToggle({ Name = "Tracer ESP", CurrentValue = false, Flag = "espTracer",
+    Callback = function(v) tracerESP = v end })
+ESPTab:CreateToggle({ Name = "Name ESP", CurrentValue = false, Flag = "espName",
+    Callback = function(v) nameESP = v end })
+ESPTab:CreateToggle({ Name = "Health ESP", CurrentValue = false, Flag = "espHealth",
+    Callback = function(v) healthESP = v end })
+ESPTab:CreateToggle({ Name = "Team Check", CurrentValue = false, Flag = "espTeamCheck",
+    Callback = function(v) espTeamCheck = v end })
+ESPTab:CreateSlider({ Name = "Render Distance", Range = {100, 5000}, Increment = 50, Suffix = "ст.",
+    CurrentValue = 1000, Flag = "renderDist",
+    Callback = function(v) renderDistance = v end })
+ESPTab:CreateColorPicker({ Name = "ESP Color", Color = Color3.fromRGB(0, 255, 0), Flag = "espColor",
+    Callback = function(c) espColor = c end })
+
+
+--========================================================
+-- SETTINGS
+--========================================================
+SettingsTab:CreateButton({
+    Name = "Toggle UI Visibility",
+    Callback = function() Rayfield:SetVisibility(not Rayfield:IsVisible()) end
+})
+
+SettingsTab:CreateParagraph({
+    Title = "Конфиг",
+    Content = "Все слайдеры/тогглы с Flag сохраняются автоматически в LunaHub/sailor_piece_v3 (включая выбор слота оружия, скиллы, God Mode тогглы, FOV, и т.д.)."
+})
+
+SettingsTab:CreateButton({
+    Name = "Unload",
+    Callback = function() if _G.LunaUnload then _G.LunaUnload() end end
+})
+
+SettingsTab:CreateParagraph({
+    Title = "Status",
+    Content = "Loaded | Game: " .. game.Name
+})
+
+--========================================================
+-- UNLOAD
+--========================================================
+_G.LunaUnload = function()
+    -- Гасим все флаги
+    espEnabled = false; boxESP = false; tracerESP = false; nameESP = false; healthESP = false
+    flyEnabled = false; infJump = false; noClip = false; antiAfk = false
+    aimbotEnabled = false
+    sp_enabled = false; sp_bossEnabled = false
+    godModeEnabled = false; godMode2Enabled = false
+
+    pcall(stopFly); pcall(stopInfJump); pcall(stopNoClip); pcall(stopAimbot)
+    pcall(stopEspLoop); pcall(spStop); pcall(spBossStop)
+    pcall(stopGodMode); pcall(stopGodMode2)
+
+    for _, c in ipairs(allConnections) do
+        pcall(function() c:Disconnect() end)
+    end
+    table.clear(allConnections)
+
+    for plr in pairs(ESP) do pcall(clearESP, plr) end
+
+    pcall(function() if tracerGui then tracerGui:Destroy() end end)
+    pcall(function() Rayfield:Destroy() end)
+
+    _G.LunaWindowGui = nil
+    _G.LunaCheatLoaded = false
+    print("[Luna] unload done")
+end
+
+-- Запуск автосохранения конфига Rayfield (если включено)
+pcall(function() if Rayfield.LoadConfiguration then Rayfield:LoadConfiguration() end end)
+
+notify("Luna Hub загружен. RightCtrl — toggle UI", 4)
+print("[Luna] ready | game: " .. game.Name)
+_G.LunaCheatLoaded = true
