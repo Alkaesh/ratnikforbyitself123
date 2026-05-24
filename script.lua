@@ -1,25 +1,24 @@
 --========================================================
--- LUNA HUB - Sailor Piece (Luna Interface Suite Edition)
--- Полный рерайт UI на Luna Interface Suite by Nebula Softworks
--- + автоматический сбор существ из Workspace.ServiceNPCs / Workspace.NPCs
+-- LUNA HUB — Sailor Piece
+-- UI: Luna Interface Suite by Nebula Softworks
+-- Авто-сбор существ из Workspace.ServiceNPCs / Workspace.NPCs при запуске.
 --========================================================
 
 -- ===== reload guard =====
-if _G.LunaCheatLoaded then
+if _G.LunaHubLoaded then
     if type(_G.LunaUnload) == "function" then pcall(_G.LunaUnload) end
-    _G.LunaCheatLoaded = false
+    _G.LunaHubLoaded = false
     _G.LunaUnload = nil
 end
 
--- Подчищаем рудименты от прошлых сессий: Kavo (ScreenGui c "Main"),
--- старый Rayfield ("Rayfield"), и Luna Interface Suite ("Luna UI" / "Luna-Old").
+-- Подчищаем ScreenGui от прошлых сессий Luna ("Luna UI" / "Luna-Old").
 pcall(function()
     local function purge(parent)
         for _, c in ipairs(parent:GetChildren()) do
             if c:IsA("ScreenGui") then
                 local nm = c.Name
-                if nm == "Rayfield" or nm == "Luna UI" or nm == "Luna-Old"
-                   or c:FindFirstChild("Main") or c:FindFirstChild("SmartWindow")
+                if nm == "Luna UI" or nm == "Luna-Old"
+                   or c:FindFirstChild("SmartWindow")
                 then
                     pcall(function() c:Destroy() end)
                 end
@@ -37,7 +36,7 @@ pcall(function()
             _G[k] = nil
         end
     end
-    -- Чтобы Luna показывал deprecation warning один раз — выставляем флаг
+    -- Luna показывает разовый deprecation warning — выставляем флаг, чтобы он молчал.
     pcall(function()
         if getgenv then getgenv().ConfirmLuna = true end
     end)
@@ -111,15 +110,23 @@ local function track(conn)
 end
 
 -- ===== утилиты =====
--- Уведомление через Luna :Notification — имя/контент/иконка (Material) +
--- длительность. Аналог старого Rayfield:Notify.
-local function notify(msg, dur)
+-- Унифицированный wrapper над Luna :Notification. Поддерживает 3 типа:
+--   notify("сообщение")          → info
+--   notify("ок!", 2, "success")   → check_circle
+--   notify("ой!", 4, "error")     → error
+local NOTIFY_ICONS = {
+    info    = "info",
+    success = "check_circle",
+    warn    = "warning",
+    error   = "error",
+}
+local function notify(msg, dur, kind)
     pcall(function()
         Luna:Notification({
             Title       = "Luna Hub",
             Content     = tostring(msg),
             Duration    = dur or 3,
-            Icon        = "info",
+            Icon        = NOTIFY_ICONS[kind or "info"] or "info",
             ImageSource = "Material",
         })
     end)
@@ -578,7 +585,7 @@ destroySplash = function()
 end
 
 -- АБСОЛЮТНАЯ страховка: даже если ниже что-то крашнет — splash умрёт через 4 сек.
--- Это решает баг "splash висит вечно", если Rayfield не загрузился.
+-- Решает баг "splash висит вечно" если библиотека UI не загрузилась.
 task.delay(4, function() pcall(destroySplash) end)
 -- ЕЩЁ ОДНА страховка прямо на корень — если 4-сек таймер не сработает,
 -- через 7 сек просто прибьём ScreenGui по ссылке через _G
@@ -594,23 +601,24 @@ end)
 
 
 -- ===== окно Luna =====
--- Luna :CreateWindow принимает одну таблицу с настройками. Возвращает Window
--- с методами :CreateTab(...) и :CreateHomeTab(...). У табов API аналогичен
--- "разделам" — :CreateSection / :CreateButton / :CreateToggle / :CreateSlider /
--- :CreateInput / :CreateDropdown / :CreateColorPicker / :CreateBind / etc.
+-- :CreateWindow принимает одну таблицу. Возвращает Window с :CreateTab(...) и
+-- :CreateHomeTab(...). У табов API аналогичен Section'ам:
+--   :CreateButton/:CreateToggle/:CreateSlider/:CreateInput/:CreateDropdown/
+--   :CreateColorPicker/:CreateBind/:CreateParagraph/:CreateLabel/:CreateDivider
+--
+-- LoadingEnabled = false — у нас СВОЙ магический круг призыва, второй экран
+-- загрузки от Luna был бы избыточен.
 local Window
 do
     local ok, win = pcall(function()
         return Luna:CreateWindow({
-            Name            = "Luna Hub | Sailor Piece",
-            Subtitle        = "by Nebula Softworks",
+            Name            = "Luna Hub",
+            Subtitle        = "Sailor Piece",
             LogoID          = "6031097225",
-            LoadingEnabled  = true,
-            LoadingTitle    = "Luna Hub",
-            LoadingSubtitle = "загрузка модулей...",
+            LoadingEnabled  = false,
             ConfigSettings  = {
-                RootFolder   = nil,
-                ConfigFolder = "LunaHub_SailorPiece",
+                RootFolder   = "LunaHub",
+                ConfigFolder = "SailorPiece",
             },
             KeySystem = false,
         })
@@ -624,24 +632,34 @@ do
     Window = win
 end
 
--- Создаём табы заранее, чтобы можно было ссылаться из любого места.
--- Luna API: Window:CreateTab{ Name, Icon (string), ImageSource ("Material"|"Lucide"),
---                              ShowTitle (bool) }. Возвращённая таблица имеет
--- те же :CreateButton/:CreateSlider/:CreateToggle/... что и Section.
-local SailorTab    = Window:CreateTab({ Name = "Sailor Piece", Icon = "anchor",          ImageSource = "Material", ShowTitle = true })
-local CombatTab    = Window:CreateTab({ Name = "Бой",          Icon = "gps_fixed",       ImageSource = "Material", ShowTitle = true })
-local PlayerTab    = Window:CreateTab({ Name = "Персонаж",     Icon = "person",          ImageSource = "Material", ShowTitle = true })
-local VisualsTab   = Window:CreateTab({ Name = "Графика",      Icon = "palette",         ImageSource = "Material", ShowTitle = true })
-local ESPTab       = Window:CreateTab({ Name = "ESP",          Icon = "visibility",      ImageSource = "Material", ShowTitle = true })
-local WorldTab     = Window:CreateTab({ Name = "Мир",          Icon = "public",          ImageSource = "Material", ShowTitle = true })
-local ExpTab       = Window:CreateTab({ Name = "⚠ Эксперимент", Icon = "science",        ImageSource = "Material", ShowTitle = true })
-local SettingsTab  = Window:CreateTab({ Name = "Настройки",    Icon = "settings",        ImageSource = "Material", ShowTitle = true })
+-- ===== Home Tab (встроенный дашборд Luna) =====
+-- Показывает аватар игрока, исполнитель, FPS/пинг/регион/друзей, кнопку Discord.
+-- Полезно как welcome-экран.
+pcall(function()
+    Window:CreateHomeTab({
+        Icon              = 1,
+        SupportedExecutors = { "Synapse", "Solara", "Wave", "AWP", "Krnl", "Delta", "Xeno", "Velocity" },
+        DiscordInvite     = "nebula", -- placeholder, замени на свою
+    })
+end)
+
+-- ===== Табы =====
+-- Иконки Lucide — современный SVG-набор, выглядит чище Material'а на Roblox.
+-- Если Lucide где-то не загрузится, fallback не нужен — Luna покажет дефолтную.
+local SailorTab    = Window:CreateTab({ Name = "Sailor Piece",    Icon = "anchor",         ImageSource = "Lucide", ShowTitle = true })
+local CombatTab    = Window:CreateTab({ Name = "Бой",             Icon = "crosshair",      ImageSource = "Lucide", ShowTitle = true })
+local PlayerTab    = Window:CreateTab({ Name = "Персонаж",        Icon = "user",           ImageSource = "Lucide", ShowTitle = true })
+local VisualsTab   = Window:CreateTab({ Name = "Графика",         Icon = "palette",        ImageSource = "Lucide", ShowTitle = true })
+local ESPTab       = Window:CreateTab({ Name = "ESP",             Icon = "eye",            ImageSource = "Lucide", ShowTitle = true })
+local WorldTab     = Window:CreateTab({ Name = "Мир",             Icon = "globe",          ImageSource = "Lucide", ShowTitle = true })
+local ExpTab       = Window:CreateTab({ Name = "Эксперимент",     Icon = "flask-conical",  ImageSource = "Lucide", ShowTitle = true })
+local SettingsTab  = Window:CreateTab({ Name = "Настройки",       Icon = "settings",       ImageSource = "Lucide", ShowTitle = true })
 
 
 --========================================================
 -- SAILOR PIECE — Auto Quest Farm
 --========================================================
-local SQuestSec  = SailorTab:CreateSection("Квест и зона")
+SailorTab:CreateSection("Квест и зона")
 
 -- ===== state =====
 -- Квестовый цикл
@@ -701,21 +719,8 @@ local function stopGodMode() end
 local function stopGodMode2() end
 
 -- ====================================================
--- Папки
--- ====================================================
-local function spGetNpcFolder()     return workspace:FindFirstChild("NPCs")        end
-local function spGetServiceFolder() return workspace:FindFirstChild("ServiceNPCs") end
-
--- ====================================================
 -- Утилиты
 -- ====================================================
-local function spStripTrailingDigits(s)
-    if type(s) ~= "string" then return "" end
-    local cleaned = s:gsub("%d+$", "")
-    if cleaned == "" then return s end
-    return cleaned
-end
-
 local function spModelPos(model)
     if not model then return nil end
     local hrp = model:FindFirstChild("HumanoidRootPart")
@@ -1672,15 +1677,16 @@ end))
 --========================================================
 
 SailorTab:CreateParagraph({
-    Title = "Как пользоваться",
-    Text = "1. Существа собраны автоматически при запуске скрипта:\n" ..
-              "   • квест-гиверы из Workspace.ServiceNPCs\n" ..
-              "   • обычные мобы и боссы из Workspace.NPCs\n" ..
-              "2. Выбери NPC и моба в выпадающих списках ниже\n" ..
-              "3. (опционально) включи God Mode v1 / Anti-Damage\n" ..
-              "4. Включи «Авто-фарм»\n\n" ..
-              "Боссы — отдельный раздел ниже. Имена очищены от суффиксов сложности " ..
-              "(medium / hard / xard / ultra…), скрипт сам найдёт нужный вариант через string.find."
+    Title = "🚀 Быстрый старт",
+    Text = "1. Существа собраны автоматически из Workspace при запуске:\n" ..
+              "      • квест-гиверы — Workspace.ServiceNPCs\n" ..
+              "      • обычные мобы и боссы — Workspace.NPCs\n" ..
+              "2. Выбери NPC и моба в выпадающих списках ниже.\n" ..
+              "3. (опционально) включи God Mode v1 / Anti-Damage.\n" ..
+              "4. Включи «Авто-фарм».\n\n" ..
+              "Боссы — отдельный раздел ниже. Имена в дропдауне очищены от " ..
+              "суффиксов сложности (medium / hard / xard / ultra…), скрипт " ..
+              "сам найдёт нужный вариант через string.find."
 })
 
 -- ===== Quest Setup =====
@@ -1821,7 +1827,7 @@ SailorTab:CreateSlider({
 
 -- ===== Combat =====
 SailorTab:CreateDivider()
-local SCombatSec = SailorTab:CreateSection("Бой и оружие")
+SailorTab:CreateSection("Бой и оружие")
 
 SailorTab:CreateParagraph({
     Title = "Слот оружия",
@@ -1908,7 +1914,7 @@ SailorTab:CreateToggle({ Name = "Скилл F", CurrentValue = sp_useF, Callback
 
 -- ===== God Mode =====
 SailorTab:CreateDivider()
-local SGodSec = SailorTab:CreateSection("God Mode и защита от урона")
+SailorTab:CreateSection("God Mode и защита от урона")
 
 SailorTab:CreateParagraph({
     Title = "Честно про God Mode в Sailor Piece",
@@ -1938,7 +1944,7 @@ SailorTab:CreateToggle({
 
 -- ===== Run =====
 SailorTab:CreateDivider()
-local SRunSec = SailorTab:CreateSection("Запуск")
+SailorTab:CreateSection("Запуск")
 
 SailorTab:CreateToggle({
     Name = "Авто-фарм (квест)",
@@ -1993,7 +1999,7 @@ SailorTab:CreateButton({
 
 -- ===== Raid Bosses =====
 SailorTab:CreateDivider()
-local SBossSec = SailorTab:CreateSection("Рейдовые боссы")
+SailorTab:CreateSection("Рейдовые боссы")
 
 SailorTab:CreateParagraph({
     Title = "Что это",
@@ -2175,7 +2181,7 @@ CombatTab:CreateToggle({
 }, "teamCheck")
 
 CombatTab:CreateDivider()
-local TPSec = CombatTab:CreateSection("Телепорт к игрокам")
+CombatTab:CreateSection("Телепорт к игрокам")
 local selectedPlayerName
 
 CombatTab:CreateButton({
@@ -2244,7 +2250,7 @@ CombatTab:CreateButton({
 --========================================================
 -- PLAYER TAB
 --========================================================
-local PMoveSec = PlayerTab:CreateSection("Передвижение")
+PlayerTab:CreateSection("Передвижение")
 
 PlayerTab:CreateParagraph({
     Title = "Внимание",
@@ -2810,8 +2816,8 @@ ESPTab:CreateParagraph({
 
 -- ====== Performance counters (FPS / ping / mem) =========
 -- Считаем FPS как 1 / средний dt по последним N кадрам (smoothed average).
--- Обновляем UI-параграф раз в 0.5 сек, чтобы не дёргать Rayfield :Set каждый кадр.
-local SPerfSec = SettingsTab:CreateSection("Монитор производительности")
+-- Параграф обновляем раз в 0.5 сек — не дёргаем :Set на каждом кадре.
+SettingsTab:CreateSection("Монитор производительности")
 local perfPara = SettingsTab:CreateParagraph({
     Title = "Live-статистика",
     Text = "FPS: --  |  Ping: -- ms  |  Mem: -- MB"
@@ -2861,123 +2867,46 @@ end
 
 SettingsTab:CreateSection("Окно")
 SettingsTab:CreateButton({
-    Name = "Скрыть/показать меню (или жми RightCtrl)",
+    Name = "Скрыть/показать меню",
+    Description = "Можно нажать RightCtrl где угодно — этот же эффект.",
     Callback = function() lunaSetVisibility(not lunaIsVisible()) end
 })
 
 -- ====================================================
--- Свой мини-конфиг (только значения, без тогглов!)
+-- Полноценный конфиг (через встроенный API Luna)
 -- ====================================================
--- Сохраняем: задержки, дальности, длительности, слот оружия, скиллы (Z/X/C/V/F),
--- множитель скорости, FOV/плавность аимбота, цвет/дальность ESP, частота ESP.
--- НЕ сохраняем: Auto Farm, Boss Farm, God Mode, Fly, NoClip, ESP Master, Aimbot —
--- любой "включатель" остаётся OFF при каждом инжекте, чтобы не было сюрпризов.
+-- Luna автоматически сохраняет ВСЕ элементы у которых есть Flag (второй
+-- аргумент при создании). Метод BuildConfigSection() добавляет UI для
+-- создания / загрузки / автозагрузки именованных конфигов в виде файлов
+-- внутри папки LunaHub/SailorPiece/settings.
 SettingsTab:CreateDivider()
-SettingsTab:CreateSection("Конфиг (только значения)")
+pcall(function() SettingsTab:BuildConfigSection() end)
 
-local LUNA_CONFIG_PATH = "LunaHub_SailorPiece.json"
-local function _serializeSettings()
-    return {
-        sp_scanRadius   = sp_scanRadius,
-        sp_searchRadius = sp_searchRadius,
-        sp_huntDuration = sp_huntDuration,
-        sp_killsPerQuest = sp_killsPerQuest,
-        sp_hoverHeight  = sp_hoverHeight,
-        sp_attackDelay  = sp_attackDelay,
-        sp_skillDelay   = sp_skillDelay,
-        sp_skillHold    = sp_skillHold,
-        sp_weaponSlot   = sp_weaponSlot,
-        sp_useZ = sp_useZ, sp_useX = sp_useX, sp_useC = sp_useC,
-        sp_useV = sp_useV, sp_useF = sp_useF,
-        sp_antiDamageHeight = sp_antiDamageHeight,
-        speedMultiplier = speedMultiplier,
-        aimbotFov       = aimbotFov,
-        aimbotSmooth    = aimbotSmooth,
-        renderDistance  = renderDistance,
-        espMinInterval  = espMinInterval,
-    }
-end
-
-local function _applySettings(t)
-    if type(t) ~= "table" then return end
-    sp_scanRadius   = t.sp_scanRadius   or sp_scanRadius
-    sp_searchRadius = t.sp_searchRadius or sp_searchRadius
-    sp_huntDuration = t.sp_huntDuration or sp_huntDuration
-    sp_killsPerQuest = t.sp_killsPerQuest or sp_killsPerQuest
-    sp_hoverHeight  = t.sp_hoverHeight  or sp_hoverHeight
-    sp_attackDelay  = t.sp_attackDelay  or sp_attackDelay
-    sp_skillDelay   = t.sp_skillDelay   or sp_skillDelay
-    sp_skillHold    = t.sp_skillHold    or sp_skillHold
-    sp_weaponSlot   = t.sp_weaponSlot   or sp_weaponSlot
-    if t.sp_useZ ~= nil then sp_useZ = t.sp_useZ end
-    if t.sp_useX ~= nil then sp_useX = t.sp_useX end
-    if t.sp_useC ~= nil then sp_useC = t.sp_useC end
-    if t.sp_useV ~= nil then sp_useV = t.sp_useV end
-    if t.sp_useF ~= nil then sp_useF = t.sp_useF end
-    sp_antiDamageHeight = t.sp_antiDamageHeight or sp_antiDamageHeight
-    speedMultiplier = t.speedMultiplier or speedMultiplier
-    aimbotFov       = t.aimbotFov       or aimbotFov
-    aimbotSmooth    = t.aimbotSmooth    or aimbotSmooth
-    renderDistance  = t.renderDistance  or renderDistance
-    espMinInterval  = t.espMinInterval  or espMinInterval
-end
-
-SettingsTab:CreateButton({
-    Name = "Сохранить значения вручную",
-    Callback = function()
-        if not (writefile and HttpService) then
-            notify("Executor не поддерживает запись файлов")
-            return
-        end
-        local ok, json = pcall(function()
-            return HttpService:JSONEncode(_serializeSettings())
-        end)
-        if not ok then notify("JSON encode error"); return end
-        local ok2, err = pcall(function() writefile(LUNA_CONFIG_PATH, json) end)
-        if ok2 then notify("Конфиг сохранён в " .. LUNA_CONFIG_PATH)
-        else notify("Не удалось записать: " .. tostring(err)) end
-    end
-})
-
-SettingsTab:CreateButton({
-    Name = "Загрузить сохранённые значения",
-    Callback = function()
-        if not (readfile and isfile and HttpService) then
-            notify("Executor не поддерживает чтение файлов")
-            return
-        end
-        if not isfile(LUNA_CONFIG_PATH) then
-            notify("Файл конфига не найден: " .. LUNA_CONFIG_PATH)
-            return
-        end
-        local ok, raw = pcall(readfile, LUNA_CONFIG_PATH)
-        if not ok then notify("Не удалось прочитать"); return end
-        local ok2, t = pcall(function() return HttpService:JSONDecode(raw) end)
-        if ok2 and type(t) == "table" then
-            _applySettings(t)
-            notify("Значения загружены — обнови UI слайдерами вручную")
-        else
-            notify("JSON-декод не удался")
-        end
-    end
-})
-
-SettingsTab:CreateParagraph({
-    Title = "Про конфиг",
-    Text = "Здесь сохраняются ТОЛЬКО ЗНАЧЕНИЯ слайдеров (задержки, скорости, FOV, слот оружия, тогглы скиллов Z/X/C/V/F). Любые «включатели» (Авто-фарм, Fly, NoClip, God Mode и т.п.) при каждом запуске остаются ВЫКЛЮЧЕНЫ — чтобы скрипт не запускал автофарм при заходе. Если хочешь восстановить значения — жми «Загрузить» после инжекта."
-})
-
+-- ====================================================
+-- Тема — кастомный градиент через встроенный BuildThemeSection
+-- ====================================================
 SettingsTab:CreateDivider()
+pcall(function() SettingsTab:BuildThemeSection() end)
+
+-- ====================================================
+-- Управление скриптом
+-- ====================================================
+SettingsTab:CreateDivider()
+SettingsTab:CreateSection("Управление скриптом")
 
 SettingsTab:CreateButton({
     Name = "Полностью выгрузить скрипт",
+    Description = "Снимет все хуки, удалит UI и вернёт игру в исходное состояние.",
     Callback = function() if _G.LunaUnload then _G.LunaUnload() end end
 })
 
 SettingsTab:CreateParagraph({
     Title = "Статус",
-    Text = "Загружен  |  Игра: " .. game.Name
+    Text = "Загружен  |  Игра: " .. game.Name .. "  |  PlaceId: " .. tostring(game.PlaceId)
 })
+
+-- Подгружаем автозагружаемый конфиг (если игрок назначил его в BuildConfigSection)
+pcall(function() Luna:LoadAutoloadConfig() end)
 
 --========================================================
 -- ⚠ EXPERIMENTAL TAB — Kill Aura
@@ -3033,7 +2962,7 @@ local function _exp_collectAuraTargets(myPos, radius)
     table.clear(_exp_auraTargets)
 
     -- Мобы из workspace.NPCs
-    local npcsFolder = spGetNpcFolder()
+    local npcsFolder = workspace:FindFirstChild("NPCs")
     if npcsFolder then
         for _, m in ipairs(npcsFolder:GetChildren()) do
             if _spIsValidAuraTarget(m) then
@@ -3283,20 +3212,18 @@ _G.LunaUnload = function()
     pcall(function() Luna:Destroy() end)
 
     _G.LunaWindowGui = nil
-    _G.LunaCheatLoaded = false
+    _G.LunaHubLoaded = false
     print("[Luna] unload done")
 end
 
--- Rayfield:LoadConfiguration() убран:
--- ConfigurationSaving = { Enabled = false }, поэтому грузить нечего.
--- Свой mini-конфиг (только значения) грузится только по нажатию кнопки в Settings.
+-- В прошлой версии был кастомный JSON-конфиг, его роль теперь
+-- закрывает встроенный BuildConfigSection (см. ниже в Settings).
 
 -- ====================================================
 -- Страховочный UIS-хендлер для toggle UI (RightControl)
 -- ====================================================
--- Rayfield-овский ToggleUIKeybind иногда залипает после
--- ручного :SetVisibility(). Поэтому держим запасной слушатель — он всегда
--- работает напрямую через UserInputService.
+-- Luna имеет свой keybind, но если он залипнет после ручного :SetVisibility,
+-- этот fallback-слушатель всегда работает напрямую через UserInputService.
 do
     local debounce = 0
     track(UIS.InputBegan:Connect(function(input, gameProcessed)
@@ -3314,6 +3241,8 @@ end
 -- Убираем splash через 2.2 сек (совпадает с финишем анимации прогресс-бара)
 task.delay(4.4, function() pcall(destroySplash) end)
 
-notify("Luna Hub загружен. RightCtrl — открыть/закрыть меню", 4)
+notify(("Найдено: NPC %d  |  Мобов %d  |  Боссов %d"):format(
+    #sp_npcChoices, #sp_mobChoices, #sp_bossChoices), 4, "success")
+notify("RightCtrl — открыть/закрыть меню", 5)
 print("[Luna] ready | game: " .. game.Name)
-_G.LunaCheatLoaded = true
+_G.LunaHubLoaded = true
