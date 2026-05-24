@@ -644,16 +644,18 @@ pcall(function()
 end)
 
 -- ===== Табы =====
--- Иконки Lucide — современный SVG-набор, выглядит чище Material'а на Roblox.
--- Если Lucide где-то не загрузится, fallback не нужен — Luna покажет дефолтную.
-local SailorTab    = Window:CreateTab({ Name = "Sailor Piece",    Icon = "anchor",         ImageSource = "Lucide", ShowTitle = true })
-local CombatTab    = Window:CreateTab({ Name = "Бой",             Icon = "crosshair",      ImageSource = "Lucide", ShowTitle = true })
-local PlayerTab    = Window:CreateTab({ Name = "Персонаж",        Icon = "user",           ImageSource = "Lucide", ShowTitle = true })
-local VisualsTab   = Window:CreateTab({ Name = "Графика",         Icon = "palette",        ImageSource = "Lucide", ShowTitle = true })
-local ESPTab       = Window:CreateTab({ Name = "ESP",             Icon = "eye",            ImageSource = "Lucide", ShowTitle = true })
-local WorldTab     = Window:CreateTab({ Name = "Мир",             Icon = "globe",          ImageSource = "Lucide", ShowTitle = true })
-local ExpTab       = Window:CreateTab({ Name = "Эксперимент",     Icon = "flask-conical",  ImageSource = "Lucide", ShowTitle = true })
-local SettingsTab  = Window:CreateTab({ Name = "Настройки",       Icon = "settings",       ImageSource = "Lucide", ShowTitle = true })
+-- ВАЖНО: используем ImageSource = "Material" — Lucide для табов в текущей версии
+-- Luna ломается ("Unable to assign property Image. ContentId expected, got table"):
+-- GetIcon возвращает таблицу {id, imageRectSize, imageRectOffset}, а CreateTab
+-- присваивает её напрямую в .Image. Material возвращает строку — работает.
+local SailorTab    = Window:CreateTab({ Name = "Sailor Piece",    Icon = "anchor",          ImageSource = "Material", ShowTitle = true })
+local CombatTab    = Window:CreateTab({ Name = "Бой",             Icon = "gps_fixed",       ImageSource = "Material", ShowTitle = true })
+local PlayerTab    = Window:CreateTab({ Name = "Персонаж",        Icon = "person",          ImageSource = "Material", ShowTitle = true })
+local VisualsTab   = Window:CreateTab({ Name = "Графика",         Icon = "palette",         ImageSource = "Material", ShowTitle = true })
+local ESPTab       = Window:CreateTab({ Name = "ESP",             Icon = "visibility",      ImageSource = "Material", ShowTitle = true })
+local WorldTab     = Window:CreateTab({ Name = "Мир",             Icon = "public",          ImageSource = "Material", ShowTitle = true })
+local ExpTab       = Window:CreateTab({ Name = "Эксперимент",     Icon = "science",         ImageSource = "Material", ShowTitle = true })
+local SettingsTab  = Window:CreateTab({ Name = "Настройки",       Icon = "settings",        ImageSource = "Material", ShowTitle = true })
 
 
 --========================================================
