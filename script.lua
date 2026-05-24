@@ -109,6 +109,131 @@ local function track(conn)
     return conn
 end
 
+-- ====================================================
+-- 📝 КРАШ-ЛОГГЕР
+-- ====================================================
+-- Пишет файл LunaHub_log.txt в папку workspace executor'а. Каждая строка
+-- сразу сбрасывается на диск (writefile перезаписывает файл целиком), так
+-- что при краше Roblox мы НЕ ТЕРЯЕМ последние записи.
+--
+-- Дополнительно: подключается LogService:MessageOut и ловит ВСЕ
+-- error/warning из Roblox (включая внутренние). При краше можно открыть файл
+-- и увидеть последние 200 строк перед смертью.
+--
+-- Файл лежит в workspace инжектора (зависит от executor'а):
+--   AWP/Wave: AWP/workspace/LunaHub_log.txt
+--   Krnl:     Krnl/workspace/LunaHub_log.txt
+--   Synapse:  workspace/LunaHub_log.txt
+local LOG_PATH = "LunaHub_log.txt"
+local LOG_MAX_LINES = 500
+local logBuffer = {}
+local logIndex = 0
+local logHasIO = (writefile ~= nil)
+
+local function logFlush()
+    if not logHasIO then return end
+    pcall(function()
+        writefile(LOG_PATH, table.concat(logBuffer, "\n"))
+    end)
+end
+
+local function lunaLog(level, message)
+    logIndex = logIndex + 1
+    local line = string.format("[%s] [%05d] [%s] %s",
+        os.date("%H:%M:%S"), logIndex, level, tostring(message))
+    table.insert(logBuffer, line)
+    -- Обрезаем буфер чтобы не разрастался бесконечно
+    if #logBuffer > LOG_MAX_LINES then
+        table.remove(logBuffer, 1)
+    end
+    -- Дублируем в Output Roblox (для F9, если игра не крашнется)
+    print(line)
+    -- Каждая запись = немедленный flush на диск
+    logFlush()
+end
+
+-- Хелпер для удобства из callback'ов
+local function logInfo(msg)  lunaLog("INFO",  msg) end
+local function logWarn(msg)  lunaLog("WARN",  msg) end
+local function logError(msg) lunaLog("ERROR", msg) end
+
+-- Стартовая запись + дамп окружения
+lunaLog("INFO", "===== LUNA HUB START =====")
+pcall(function()
+    lunaLog("INFO", "Game: " .. tostring(game.Name) .. "  PlaceId: " .. tostring(game.PlaceId))
+    lunaLog("INFO", "Executor: " .. (identifyexecutor and tostring(identifyexecutor()) or "unknown"))
+    lunaLog("INFO", "Player: " .. (LocalPlayer and LocalPlayer.Name or "?"))
+    lunaLog("INFO", "FileIO available: " .. tostring(logHasIO))
+end)
+
+-- Глобальный перехватчик ошибок Roblox через LogService.
+-- Ловим warning/error/всё что прилетает через game:GetService("LogService").
+-- pcall — потому что в некоторых executor'ах LogService может быть закрыт.
+pcall(function()
+    local LogService = game:GetService("LogService")
+    track(LogService.MessageOut:Connect(function(msg, msgType)
+        -- msgType: Output / Info / Warning / Error
+        if msgType == Enum.MessageType.MessageWarning then
+            lunaLog("ROBLOX_WARN", msg)
+        elseif msgType == Enum.MessageType.MessageError then
+            lunaLog("ROBLOX_ERR", msg)
+        end
+    end))
+end)
+
+-- ScriptContext.Error ловит "сырые" исключения скриптов (даже до того как
+-- они попадут в LogService). Даёт сообщение, stacktrace и сам скрипт.
+pcall(function()
+    local SC = game:GetService("ScriptContext")
+    track(SC.Error:Connect(function(message, stack, scriptInst)
+        local sn = "?"
+        pcall(function() sn = scriptInst and scriptInst:GetFullName() or "?" end)
+        lunaLog("SCRIPT_ERR", string.format("[%s] %s", sn, message))
+        if stack and stack ~= "" then
+            lunaLog("SCRIPT_ERR", "stack:\n" .. stack)
+        end
+    end))
+end)
+
+-- Heartbeat-маячок раз в 5 секунд. Последняя запись покажет в логе момент
+-- зависания/краша. Включает FPS и текущее состояние циклов.
+do
+    local frameTimes = {}
+    local sumDt = 0
+    track(game:GetService("RunService").Heartbeat:Connect(function(dt)
+        table.insert(frameTimes, dt)
+        sumDt = sumDt + dt
+        if #frameTimes > 60 then sumDt = sumDt - table.remove(frameTimes, 1) end
+    end))
+    task.spawn(function()
+        while _G.LunaHubLoaded ~= false do
+            task.wait(5)
+            local fps = (#frameTimes > 0 and sumDt > 0) and (#frameTimes / sumDt) or 0
+            -- НЕ записываем если ничего интересного не происходит — иначе лог
+            -- забьётся "alive" строками. Логируем только если запущен фарм.
+            if sp_enabled or sp_bossEnabled then
+                lunaLog("HEARTBEAT", string.format(
+                    "fps=%.1f quest=%s boss=%s state=%s mob=%s",
+                    fps,
+                    sp_enabled and "ON" or "off",
+                    sp_bossEnabled and "ON" or "off",
+                    tostring(_G.QuestState),
+                    sp_currentMob and sp_currentMob.Name or "nil"))
+            end
+        end
+    end)
+end
+
+-- Безопасный pcall: логирует exception и возвращает успех/результат.
+-- Использование: local ok, res = safeCall(name, function() ... end)
+local function safeCall(label, fn, ...)
+    local ok, err = pcall(fn, ...)
+    if not ok then
+        logError(string.format("%s FAILED: %s", tostring(label), tostring(err)))
+    end
+    return ok, err
+end
+
 -- ===== утилиты =====
 -- Унифицированный wrapper над Luna :Notification. Поддерживает 3 типа:
 --   notify("сообщение")          → info
@@ -121,6 +246,8 @@ local NOTIFY_ICONS = {
     error   = "error",
 }
 local function notify(msg, dur, kind)
+    -- Логируем КАЖДУЮ нотификацию — это хороший trail событий
+    lunaLog(string.upper(kind or "info"), "notify: " .. tostring(msg))
     pcall(function()
         Luna:Notification({
             Title       = "Luna Hub",
@@ -130,7 +257,6 @@ local function notify(msg, dur, kind)
             ImageSource = "Material",
         })
     end)
-    print("[Luna] " .. tostring(msg))
 end
 
 -- Хелпер: спрятать/показать Luna UI.
@@ -675,14 +801,28 @@ end
 -- Luna ломается ("Unable to assign property Image. ContentId expected, got table"):
 -- GetIcon возвращает таблицу {id, imageRectSize, imageRectOffset}, а CreateTab
 -- присваивает её напрямую в .Image. Material возвращает строку — работает.
-local SailorTab    = Window:CreateTab({ Name = "Sailor Piece",    Icon = "anchor",          ImageSource = "Material", ShowTitle = true })
-local CombatTab    = Window:CreateTab({ Name = "Бой",             Icon = "gps_fixed",       ImageSource = "Material", ShowTitle = true })
-local PlayerTab    = Window:CreateTab({ Name = "Персонаж",        Icon = "person",          ImageSource = "Material", ShowTitle = true })
-local VisualsTab   = Window:CreateTab({ Name = "Графика",         Icon = "palette",         ImageSource = "Material", ShowTitle = true })
-local ESPTab       = Window:CreateTab({ Name = "ESP",             Icon = "visibility",      ImageSource = "Material", ShowTitle = true })
-local WorldTab     = Window:CreateTab({ Name = "Мир",             Icon = "public",          ImageSource = "Material", ShowTitle = true })
-local ExpTab       = Window:CreateTab({ Name = "Эксперимент",     Icon = "science",         ImageSource = "Material", ShowTitle = true })
-local SettingsTab  = Window:CreateTab({ Name = "Настройки",       Icon = "settings",        ImageSource = "Material", ShowTitle = true })
+--
+-- Структура табов:
+--   ⚓ Sailor Piece     — главное: квестовый авто-фарм + кнопки действий
+--   👹 Боссы           — очередь боссов + авто-фарм рейдов
+--   ⚙ Параметры фарма — все слайдеры (задержки, скорости, оружие, скиллы)
+--   🎯 Бой             — Aimbot, TP к игрокам
+--   🧍 Персонаж         — fly, noclip, скорость, прыжок, anti-AFK
+--   🎨 Графика          — fog/fullbright/sky
+--   👁 ESP              — подсветка игроков
+--   🌍 Мир             — гравитация, время суток
+--   🧪 Эксперимент     — Kill Aura, Magnet
+--   ⚙ Настройки       — конфиги, тема, выгрузка
+local SailorTab     = Window:CreateTab({ Name = "Sailor Piece",     Icon = "anchor",         ImageSource = "Material", ShowTitle = true })
+local BossTab       = Window:CreateTab({ Name = "Боссы",            Icon = "whatshot",       ImageSource = "Material", ShowTitle = true })
+local FarmCfgTab    = Window:CreateTab({ Name = "Параметры фарма",  Icon = "tune",           ImageSource = "Material", ShowTitle = true })
+local CombatTab     = Window:CreateTab({ Name = "Бой",              Icon = "gps_fixed",      ImageSource = "Material", ShowTitle = true })
+local PlayerTab     = Window:CreateTab({ Name = "Персонаж",         Icon = "person",         ImageSource = "Material", ShowTitle = true })
+local VisualsTab    = Window:CreateTab({ Name = "Графика",          Icon = "palette",        ImageSource = "Material", ShowTitle = true })
+local ESPTab        = Window:CreateTab({ Name = "ESP",              Icon = "visibility",     ImageSource = "Material", ShowTitle = true })
+local WorldTab      = Window:CreateTab({ Name = "Мир",              Icon = "public",         ImageSource = "Material", ShowTitle = true })
+local ExpTab        = Window:CreateTab({ Name = "Эксперимент",      Icon = "science",        ImageSource = "Material", ShowTitle = true })
+local SettingsTab   = Window:CreateTab({ Name = "Настройки",        Icon = "settings",       ImageSource = "Material", ShowTitle = true })
 
 
 --========================================================
@@ -936,6 +1076,31 @@ local sp_mobLookup   = {}     -- entry -> baseName (для string.find в NPC п
 local sp_bossChoices = {}     -- массив cleaned-имён боссов
 local sp_bossLookup  = {}     -- cleanedName -> cleanedName (для string.find)
 
+-- Преднабор имён боссов Sailor Piece. Сюда добавляй известные имена даже если
+-- их сейчас нет в Workspace — список в дропдауне всё равно их покажет, чтобы
+-- можно было поставить в очередь "до спавна". Поиск во время боя использует
+-- string.find по lower-case, так что суффиксы сложности (medium/hard/xard/ultra)
+-- НЕ нужны — они подцепятся автоматически.
+local SP_BOSS_PRESET = {
+    -- Известные / часто встречающиеся в Sailor Piece. Очищенные базовые имена.
+    "bossultra",
+    "blackreaper",
+    "monkey boss",
+    "thiefboss",
+    "kingboss",
+    "captainboss",
+    "dragonboss",
+    "skeletonboss",
+    "demonboss",
+    "shogunboss",
+    "samuraiboss",
+    "kraken",
+    "leviathan",
+    "phantomboss",
+    "iceboss",
+    "fireboss",
+}
+
 -- Функция авто-сбора. Вызывается один раз при старте + по запросу (refresh).
 -- Перезаполняет все четыре таблицы выше.
 local function spAutoCollectAll()
@@ -973,8 +1138,8 @@ local function spAutoCollectAll()
     sp_bossLookup  = {}
     do
         local folder = workspace:FindFirstChild("NPCs")
+        local seenMob, seenBoss = {}, {}
         if folder then
-            local seenMob, seenBoss = {}, {}
             for _, m in ipairs(folder:GetChildren()) do
                 if m:IsA("Model") then
                     local rawName = m.Name
@@ -998,16 +1163,37 @@ local function spAutoCollectAll()
                     end
                 end
             end
-            table.sort(sp_mobChoices)
-            table.sort(sp_bossChoices)
         end
+
+        -- ⭐ Доливаем preset боссов: даже если босса сейчас нет на сервере,
+        -- его имя будет в дропдауне и игрок сможет поставить его в очередь.
+        for _, name in ipairs(SP_BOSS_PRESET) do
+            local clean = name:lower()
+            if not seenBoss[clean] then
+                seenBoss[clean] = true
+                sp_bossLookup[clean] = clean
+                table.insert(sp_bossChoices, clean)
+            end
+        end
+
+        table.sort(sp_mobChoices)
+        table.sort(sp_bossChoices)
         if #sp_mobChoices  == 0 then table.insert(sp_mobChoices,  "(нет мобов)") end
         if #sp_bossChoices == 0 then table.insert(sp_bossChoices, "(нет боссов)") end
     end
 end
 
 -- Сразу выполняем сбор при загрузке скрипта — UI получит уже готовые списки.
-spAutoCollectAll()
+do
+    local ok, err = pcall(spAutoCollectAll)
+    if not ok then
+        lunaLog("ERROR", "spAutoCollectAll FAILED: " .. tostring(err))
+    else
+        lunaLog("INFO", string.format(
+            "auto-collect: NPC=%d mobs=%d bosses=%d",
+            #sp_npcChoices, #sp_mobChoices, #sp_bossChoices))
+    end
+end
 
 -- ====================================================
 -- Поиск моба / NPC по имени
@@ -1233,8 +1419,14 @@ local function spStart()
     sp_enabled = true
     -- Free Combat начинает сразу с Hunting
     _G.QuestState = sp_freeCombat and "Hunting" or "TakeQuest"
+    lunaLog("INFO", string.format(
+        "spStart: npc='%s' mob='%s' free=%s killsPerQuest=%d",
+        sp_questNpcName, sp_mobBaseName, tostring(sp_freeCombat), sp_killsPerQuest))
 
     sp_loopThread = task.spawn(function()
+        -- xpcall ловит любую ошибку и пишет stacktrace в лог,
+        -- иначе при краше игра умирает молча.
+        local ok, err = xpcall(function()
         while sp_enabled do
             local hum = safeGetHumanoid(safeGetCharacter())
             if not hum or hum.Health <= 0 then
@@ -1336,6 +1528,21 @@ local function spStart()
             end
             task.wait(0.05)
         end
+        end, function(err)
+            -- xpcall handler — пишем traceback в лог
+            lunaLog("ERROR", "QUEST LOOP CRASH: " .. tostring(err))
+            lunaLog("ERROR", debug.traceback("", 2))
+        end)
+        if not ok then
+            -- xpcall вернул false, но если поток завершился штатно — ok=true
+            sp_enabled = false
+            pcall(function()
+                Luna:Notification({
+                    Title = "Luna Hub", Content = "Квест-цикл упал, см. лог",
+                    Duration = 5, Icon = "error", ImageSource = "Material",
+                })
+            end)
+        end
         sp_currentMob = nil
         sp_loopThread = nil
     end)
@@ -1355,6 +1562,10 @@ end
 -- spAutoCollectAll выше) — берётся из workspace.NPCs, фильтруется по слову
 -- "boss" в имени (любой регистр), очищается от суффиксов сложности и
 -- дедуплицируется. UI работает с уже готовым списком sp_bossChoices.
+-- Очередь боссов. UI поддерживает MultipleOptions: можно выбрать N имён,
+-- скрипт убивает их по порядку. Когда первый умер — переключается на второго.
+-- sp_bossQueue ХРАНИТ ВЫБОР; runtime читает sp_bossRootName из неё.
+local sp_bossQueue       = {}     -- массив cleaned-имён боссов в порядке выбора
 local sp_bossDisplayName = sp_bossChoices[1] or ""
 local sp_bossRootName    = sp_bossLookup[sp_bossDisplayName] or sp_bossDisplayName
 
@@ -1398,32 +1609,69 @@ local function spFindBoss(rootName)
     return best, bestHum
 end
 
+-- Хелпер: получить актуальную очередь целей. Если sp_bossQueue пуст —
+-- fallback на одиночный sp_bossRootName (обратная совместимость).
+local function _spGetBossTargets()
+    if sp_bossQueue and #sp_bossQueue > 0 then return sp_bossQueue end
+    if sp_bossRootName and sp_bossRootName ~= "" then return { sp_bossRootName } end
+    return {}
+end
+
 local function spBossStart()
     if sp_bossThread then return end
-    if not sp_bossRootName or sp_bossRootName == "" then
-        notify("Выбери босса в дропдауне")
+    local queue = _spGetBossTargets()
+    if #queue == 0 then
+        notify("Выбери хотя бы одного босса в дропдауне", 3, "warn")
         return
     end
     if sp_enabled then spStop() end
 
     sp_bossEnabled = true
+    lunaLog("INFO", "spBossStart: queue=[" .. table.concat(_spGetBossTargets(), ", ") .. "]")
     sp_bossThread = task.spawn(function()
+        local idx = 1   -- текущий босс в очереди
+        local lastNotifiedTarget = nil   -- чтобы не спамить нотификациями
+        local ok, err = xpcall(function()
         while sp_bossEnabled do
             local hum = safeGetHumanoid(safeGetCharacter())
             if not hum or hum.Health <= 0 then
                 sp_currentMob = nil
                 task.wait(1)
             else
-                local boss, bossHum = spFindBoss(sp_bossRootName)
+                -- Каждый кадр освежаем очередь — игрок мог поменять выбор в UI.
+                local q = _spGetBossTargets()
+                if #q == 0 then
+                    notify("Очередь боссов пуста — выключаю авто-фарм", 3, "warn")
+                    break
+                end
+                if idx > #q then idx = 1 end
+                local target = q[idx]
+
+                local boss, bossHum = spFindBoss(target)
                 if not boss then
                     sp_currentMob = nil
-                    notify("Босс '" .. sp_bossRootName .. "' не найден — жду 4с", 2)
-                    local w = 0
-                    while sp_bossEnabled and w < 4 do
-                        task.wait(0.25); w = w + 0.25
+                    -- Если босса нет — пробуем следующего в очереди (а не ждём
+                    -- 4 секунды на одном). Это критично для очереди — иначе
+                    -- застрянем на отсутствующем боссе.
+                    if #q > 1 then
+                        idx = idx + 1
+                        if idx > #q then idx = 1 end
+                        task.wait(0.4)
+                    else
+                        notify(("Босс '%s' не найден — жду 4с"):format(target), 2, "warn")
+                        local w = 0
+                        while sp_bossEnabled and w < 4 do
+                            task.wait(0.25); w = w + 0.25
+                        end
                     end
                 else
                     sp_currentMob = boss
+                    -- Уведомляем только если сменился target (не дёргаем notify
+                    -- каждый цикл, иначе спам при длинной очереди).
+                    if lastNotifiedTarget ~= target then
+                        notify(("Босс [%d/%d]: %s"):format(idx, #q, target), 2)
+                        lastNotifiedTarget = target
+                    end
                     if not godModeEnabled and not sp_antiDamage then
                         local p = spModelPos(boss)
                         if p then
@@ -1438,14 +1686,9 @@ local function spBossStart()
                         and boss.Parent
                         and bossHum and bossHum.Health > 0
                     do
-                        -- Освежаем ссылку на Humanoid каждый кадр —
-                        -- если босс был перерождён или модель пересобрана.
                         bossHum = boss:FindFirstChildOfClass("Humanoid") or bossHum
                         spHoverAbove(boss)
                         spMouseClick()
-                        -- ПЕРЕСОБИРАЕМ skillKeys на каждой итерации, чтобы тогглы
-                        -- Z/X/C/V/F работали в реальном времени (раньше snapshot
-                        -- делался ОДИН раз перед боем — toggle игнорировался).
                         local skillKeys = spActiveSkillKeys()
                         if #skillKeys > 0 and (tick() - lastSkill) >= sp_skillDelay then
                             if skillIdx > #skillKeys then skillIdx = 1 end
@@ -1456,10 +1699,29 @@ local function spBossStart()
                         task.wait(sp_attackDelay)
                     end
                     sp_currentMob = nil
+                    -- Босс умер → переходим к следующему в очереди
+                    if not boss.Parent or (bossHum and bossHum.Health <= 0) then
+                        idx = idx + 1
+                        if idx > #q then idx = 1 end
+                        notify(("Убит. Переключаюсь на [%d/%d]"):format(idx, #q), 2, "success")
+                    end
                     task.wait(0.5)
                 end
             end
             task.wait(0.05)
+        end
+        end, function(e)
+            lunaLog("ERROR", "BOSS LOOP CRASH: " .. tostring(e))
+            lunaLog("ERROR", debug.traceback("", 2))
+        end)
+        if not ok then
+            sp_bossEnabled = false
+            pcall(function()
+                Luna:Notification({
+                    Title = "Luna Hub", Content = "Boss-цикл упал, см. лог",
+                    Duration = 5, Icon = "error", ImageSource = "Material",
+                })
+            end)
         end
         sp_currentMob = nil
         sp_bossThread = nil
@@ -1713,20 +1975,18 @@ end))
 
 SailorTab:CreateParagraph({
     Title = "🚀 Быстрый старт",
-    Text = "1. Существа собраны автоматически из Workspace при запуске:\n" ..
+    Text = "Существа собраны автоматически из Workspace при запуске:\n" ..
               "      • квест-гиверы — Workspace.ServiceNPCs\n" ..
-              "      • обычные мобы и боссы — Workspace.NPCs\n" ..
-              "2. Выбери NPC и моба в выпадающих списках ниже.\n" ..
-              "3. (опционально) включи God Mode v1 / Anti-Damage.\n" ..
-              "4. Включи «Авто-фарм».\n\n" ..
-              "Боссы — отдельный раздел ниже. Имена в дропдауне очищены от " ..
-              "суффиксов сложности (medium / hard / xard / ultra…), скрипт " ..
-              "сам найдёт нужный вариант через string.find."
+              "      • обычные мобы и боссы — Workspace.NPCs\n\n" ..
+              "Здесь только ФАРМ. Тонкая настройка задержек, оружия, скиллов — " ..
+              "во вкладке «Параметры фарма». Авто-фарм рейдовых боссов и очередь — " ..
+              "во вкладке «Боссы»."
 })
 
 -- ===== Quest Setup =====
--- Дропдауны заполняются СРАЗУ из авто-собранных списков (sp_npcChoices /
--- sp_mobChoices). Никаких кнопок Scan нет — данные актуальны на момент запуска.
+-- Дропдауны заполняются СРАЗУ из авто-собранных списков. Никаких автоматических
+-- watcher'ов на Workspace — они вызывали лавину обновлений и крашили клиент при
+-- массовых respawn'ах. Если что-то изменилось — жми кнопку refresh ниже.
 local npcDropdown, mobDropdown, bossDropdown   -- forward decl
 
 local function _resolveNpcCode(label)
@@ -1752,7 +2012,8 @@ do
 end
 
 npcDropdown = SailorTab:CreateDropdown({
-    Name = "NPC квеста (Workspace.ServiceNPCs)",
+    Name = "NPC квеста",
+    Description = "Источник: Workspace.ServiceNPCs",
     Options = sp_npcChoices,
     CurrentOption = { sp_npcChoices[1] },
     MultipleOptions = false,
@@ -1764,7 +2025,8 @@ npcDropdown = SailorTab:CreateDropdown({
 }, "sp_questNpc")
 
 mobDropdown = SailorTab:CreateDropdown({
-    Name = "Моб для фарма (Workspace.NPCs, без слова boss)",
+    Name = "Моб для фарма",
+    Description = "Источник: Workspace.NPCs (без слова boss в имени)",
     Options = sp_mobChoices,
     CurrentOption = { sp_mobChoices[1] },
     MultipleOptions = false,
@@ -1775,8 +2037,7 @@ mobDropdown = SailorTab:CreateDropdown({
     end
 }, "sp_mob")
 
--- Хелпер: переcобрать списки и обновить все три дропдауна сразу.
--- forward-decl: dropdown'ы создаются ниже, поэтому используем upvalue.
+-- Хелпер: пересобрать списки и обновить все три дропдауна сразу.
 local function spRefreshAllDropdowns()
     spAutoCollectAll()
     if npcDropdown and npcDropdown.Set then
@@ -1790,8 +2051,11 @@ local function spRefreshAllDropdowns()
         end)
     end
     if bossDropdown and bossDropdown.Set then
+        -- Сохраняем текущий выбор очереди, иначе при refresh всё сбросится.
+        local keep = (sp_bossQueue and #sp_bossQueue > 0) and sp_bossQueue
+            or { sp_bossChoices[1] }
         pcall(function()
-            bossDropdown:Set({ Options = sp_bossChoices, CurrentOption = { sp_bossChoices[1] } })
+            bossDropdown:Set({ Options = sp_bossChoices, CurrentOption = keep })
         end)
     end
     if not _isPlaceholder(sp_npcChoices[1]) then
@@ -1800,275 +2064,64 @@ local function spRefreshAllDropdowns()
     if not _isPlaceholder(sp_mobChoices[1]) then
         sp_mobBaseName = _resolveMobCode(sp_mobChoices[1]) or sp_mobBaseName
     end
-    if not _isPlaceholder(sp_bossChoices[1]) then
-        sp_bossDisplayName = sp_bossChoices[1]
-        sp_bossRootName    = sp_bossLookup[sp_bossDisplayName] or sp_bossDisplayName
-    end
 end
 
--- Кнопка ручного refresh — на случай если по ходу игры в Workspace.NPCs
--- появились новые модели (новая зона / спавн босса).
 SailorTab:CreateButton({
-    Name = "🔄 Пересобрать списки (ручной refresh)",
-    Description = "Обнови если в локации появились новые мобы/NPC после загрузки",
+    Name = "🔄 Пересобрать списки",
+    Description = "Жми если на сервере появились новые NPC / мобы / боссы",
     Callback = function()
         spRefreshAllDropdowns()
-        notify(("NPC: %d  |  Мобов: %d  |  Боссов: %d")
+        notify(("NPC: %d  •  Мобов: %d  •  Боссов: %d")
             :format(#sp_npcChoices, #sp_mobChoices, #sp_bossChoices),
             3, "success")
     end
 })
 
 -- ====================================================
--- АВТОМАТИЧЕСКИЙ watcher на новые/удалённые модели
+-- ЗАПУСК — главные тогглы
 -- ====================================================
--- Ловим ChildAdded/ChildRemoved на Workspace.NPCs и Workspace.ServiceNPCs.
--- Дебаунсим 0.5сек, чтобы при массовом respawn'е не дёргать UI 100 раз подряд.
-do
-    local pendingRefresh = false
-    local function scheduleRefresh()
-        if pendingRefresh then return end
-        pendingRefresh = true
-        task.delay(0.5, function()
-            pendingRefresh = false
-            pcall(spRefreshAllDropdowns)
-        end)
-    end
-
-    local function bind(folder)
-        if not folder then return end
-        track(folder.ChildAdded:Connect(function(c)
-            if c:IsA("Model") then scheduleRefresh() end
-        end))
-        track(folder.ChildRemoved:Connect(function(c)
-            if c:IsA("Model") then scheduleRefresh() end
-        end))
-    end
-
-    bind(workspace:FindFirstChild("NPCs"))
-    bind(workspace:FindFirstChild("ServiceNPCs"))
-    -- Если папок ещё нет — слушаем их создание
-    track(workspace.ChildAdded:Connect(function(c)
-        if c.Name == "NPCs" or c.Name == "ServiceNPCs" then
-            bind(c)
-            scheduleRefresh()
-        end
-    end))
-end
-
-SailorTab:CreateParagraph({
-    Title = "Об авто-сборе",
-    Text = "Скрипт автоматически читает Workspace.ServiceNPCs и Workspace.NPCs " ..
-              "при запуске. NPC из ServiceNPCs идут в дропдаун квестов. Из NPCs " ..
-              "выделяются боссы по слову «boss» в имени (любой регистр) и попадают " ..
-              "в раздел «Рейдовые боссы». Все остальные — обычные мобы.\n\n" ..
-              "Имена боссов очищены от суффиксов сложности — в дропдауне один пункт " ..
-              "«bossultra» вместо трёх «bossultra medium / hard / xard». Поиск во " ..
-              "время боя идёт по частичному совпадению, поэтому скрипт находит " ..
-              "конкретную сложность сам."
-})
-
-SailorTab:CreateSlider({
-    Name = "Радиус поиска моба (во время охоты) (ст.)",
-    Range = { 50, 1000 },
-    Increment = 25,
-
-    CurrentValue = sp_searchRadius,
-    Callback = function(v) sp_searchRadius = v end
-}, "sp_searchRadius")
-
-SailorTab:CreateSlider({
-    Name = "Длительность охоты (макс. время до возврата) (сек)",
-    Range = { 15, 300 },
-    Increment = 5,
-
-    CurrentValue = sp_huntDuration,
-    Callback = function(v) sp_huntDuration = v end
-}, "sp_huntDuration")
-
-SailorTab:CreateSlider({
-    Name = "Убийств на один квест",
-    Range = { 1, 30 },
-    Increment = 1,
-
-    CurrentValue = sp_killsPerQuest,
-    Callback = function(v) sp_killsPerQuest = v end
-}, "sp_killsPerQuest")
-
-SailorTab:CreateParagraph({
-    Title = "Логика возврата к NPC",
-    Text = "Скрипт идёт обратно к NPC сдать квест когда выполняется ЛЮБОЕ из условий:\n• Убил «Убийств на один квест» мобов (по умолчанию 5)\n• Прошло «Длительность охоты» секунд (по умолчанию 60)\n• Моб не найден в радиусе поиска\n\nFree Combat игнорирует оба лимита и фармит вечно."
-})
-
-SailorTab:CreateSlider({
-    Name = "Высота парения над мобом (ст.)",
-    Range = { 3, 20 },
-    Increment = 1,
-
-    CurrentValue = sp_hoverHeight,
-    Callback = function(v) sp_hoverHeight = v end
-}, "sp_hoverHeight")
-
--- ===== Combat =====
-SailorTab:CreateDivider()
-SailorTab:CreateSection("Бой и оружие")
-
-SailorTab:CreateParagraph({
-    Title = "Слот оружия",
-    Text = "После смерти игра экипирует слот 1 по умолчанию. Скрипт автоматически перенажимает выбранную тут цифру при каждом respawn — чтобы ты сам не путался в инвентаре."
-})
-
-SailorTab:CreateSlider({
-    Name = "Слот оружия (1—5)",
-    Range = { 1, 5 },
-    Increment = 1,
-
-    CurrentValue = sp_weaponSlot,
-    Callback = function(v)
-        sp_weaponSlot = v
-        spSelectSlot(v)
-    end
-}, "sp_weaponSlot")
-
-SailorTab:CreateToggle({
-    Name = "Авто-экип после возрождения",
-    CurrentValue = sp_autoEquip,
-    Callback = function(v) sp_autoEquip = v end
-}, "sp_autoEquip")
-
-SailorTab:CreateButton({
-    Name = "Экипировать слот сейчас",
-    Callback = function() spSelectSlot(sp_weaponSlot) end
-})
-
-SailorTab:CreateParagraph({
-    Title = "Поведение кликов",
-    Text = "«Бить руками» — отправлять клики мыши через VirtualInputManager.\n" ..
-              "«Только с оружием» — не бить если в руках ничего нет (пропускать кадр и переэкипировать)."
-})
-
-SailorTab:CreateToggle({
-    Name = "Бить руками (клики мыши)",
-    CurrentValue = not sp_handFightOff,
-    Callback = function(v) sp_handFightOff = not v end
-}, "sp_handFight")
-
-SailorTab:CreateToggle({
-    Name = "Бить только с оружием",
-    CurrentValue = sp_useHandsOnly,
-    Callback = function(v) sp_useHandsOnly = v end
-}, "sp_requireTool")
-
-SailorTab:CreateSlider({
-    Name = "Задержка между кликами (сек)",
-    Range = { 0.15, 1.0 },
-    Increment = 0.05,
-
-    CurrentValue = sp_attackDelay,
-    Callback = function(v) sp_attackDelay = v end
-}, "sp_attackDelay")
-
-SailorTab:CreateSlider({
-    Name = "Задержка между скиллами (сек)",
-    Range = { 0.3, 5.0 },
-    Increment = 0.1,
-
-    CurrentValue = sp_skillDelay,
-    Callback = function(v) sp_skillDelay = v end
-}, "sp_skillDelay")
-
-SailorTab:CreateSlider({
-    Name = "Удержание клавиши скилла (сек)",
-    Range = { 0.05, 0.5 },
-    Increment = 0.05,
-
-    CurrentValue = sp_skillHold,
-    Callback = function(v) sp_skillHold = v end
-}, "sp_skillHold")
-
-SailorTab:CreateParagraph({
-    Title = "Скиллы",
-    Text = "Тогглы ниже включают/выключают конкретные клавиши в ротации. Работают и для квестов, и для боссов."
-})
-SailorTab:CreateToggle({ Name = "Скилл Z", CurrentValue = sp_useZ, Callback = function(v) sp_useZ = v end }, "sp_useZ")
-SailorTab:CreateToggle({ Name = "Скилл X", CurrentValue = sp_useX, Callback = function(v) sp_useX = v end }, "sp_useX")
-SailorTab:CreateToggle({ Name = "Скилл C", CurrentValue = sp_useC, Callback = function(v) sp_useC = v end }, "sp_useC")
-SailorTab:CreateToggle({ Name = "Скилл V", CurrentValue = sp_useV, Callback = function(v) sp_useV = v end }, "sp_useV")
-SailorTab:CreateToggle({ Name = "Скилл F", CurrentValue = sp_useF, Callback = function(v) sp_useF = v end }, "sp_useF")
-
--- ===== God Mode =====
-SailorTab:CreateDivider()
-SailorTab:CreateSection("God Mode и защита от урона")
-
-SailorTab:CreateParagraph({
-    Title = "Честно про God Mode в Sailor Piece",
-    Text = "Sailor Piece — серверно-авторизованная игра. Сервер сам считает HP и replicate'ит его клиенту.\n\n" ..
-              "▸ v1 (Noclip + парение) — работает: ты летаешь над целью, melee и AOE не достают. Обычные мобы теряют тебя.\n\n" ..
-              "▸ v2 (HP-restore) — на 99% игр НЕ РАБОТАЕТ. Сервер перезапишет HP обратно через replication. Оставляю в коде, может в каком-то ивенте сработает.\n\n" ..
-              "▸ ⭐ Anti-Damage Anchor (ниже) — единственный реальный способ против шот-боссов. Поднимает на 50-200 ст. + якорит. Большинство атак не достанут хитбокс."
-})
-
-SailorTab:CreateToggle({
-    Name = "God Mode v1 — Noclip + парение (рабочий)",
-    CurrentValue = false,
-    Callback = function(v)
-        godModeEnabled = v
-        if v then startGodMode() else stopGodMode() end
-    end
-}, "godModeV1")
-
-SailorTab:CreateToggle({
-    Name = "God Mode v2 — HP-restore (визуальный)",
-    CurrentValue = false,
-    Callback = function(v)
-        godMode2Enabled = v
-        if v then startGodMode2() else stopGodMode2() end
-    end
-}, "godModeV2")
-
--- ===== Run =====
 SailorTab:CreateDivider()
 SailorTab:CreateSection("Запуск")
 
--- Скорость перелёта между точками. Раньше дефолт был 110 ст/сек — летел медленно;
--- теперь 350. Слайдер в UI чтобы можно было замедлить если игра стучит anti-cheat'ом.
-SailorTab:CreateSlider({
-    Name = "Скорость полёта (ст/сек)",
-    Range = { 50, 1000 },
-    Increment = 25,
-    CurrentValue = sp_maxSpeed,
-    Callback = function(v) sp_maxSpeed = v end
-}, "sp_maxSpeed")
-
 SailorTab:CreateToggle({
-    Name = "Мгновенный TP (без анимации полёта)",
-    Description = "Самый быстрый вариант, но сервер может расценить как teleport-detection.",
-    CurrentValue = sp_instantTp,
-    Callback = function(v) sp_instantTp = v end
-}, "sp_instantTp")
-
-SailorTab:CreateToggle({
-    Name = "Авто-фарм (квест)",
+    Name = "▶ Авто-фарм (квест)",
+    Description = "Бегает к NPC, берёт квест, фармит мобов, возвращается.",
     CurrentValue = false,
     Callback = function(v)
+        lunaLog("INFO", "Toggle Auto-фарм (квест) = " .. tostring(v))
         if v then spStart() else spStop() end
     end
 }, "sp_autoFarm")
 
+SailorTab:CreateToggle({
+    Name = "Free Combat (без квеста)",
+    Description = "Бьёт выбранного моба бесконечно, не ходит к NPC.",
+    CurrentValue = false,
+    Callback = function(v) sp_freeCombat = v end
+}, "sp_freeCombat")
+
+-- ====================================================
+-- БЫСТРЫЕ ДЕЙСТВИЯ
+-- ====================================================
+SailorTab:CreateDivider()
+SailorTab:CreateSection("Быстрые действия")
+
 SailorTab:CreateButton({
-    Name = "Взять квест сейчас",
+    Name = "📥 Взять квест сейчас",
+    Description = "Один раз слетать к NPC и активировать диалог.",
     Callback = function()
         task.spawn(function()
             _sp_forcedTp = true
             local npc = spFindQuestNpc(sp_questNpcName)
-            if npc then spTakeQuestFrom(npc) else notify("NPC не найден") end
+            if npc then spTakeQuestFrom(npc) else notify("NPC не найден", 3, "warn") end
             _sp_forcedTp = false
         end)
     end
 })
 
 SailorTab:CreateButton({
-    Name = "Телепорт к мобу",
+    Name = "🎯 Телепорт к мобу",
+    Description = "Прыгнуть к ближайшему мобу из дропдауна.",
     Callback = function()
         task.spawn(function()
             _sp_forcedTp = true
@@ -2079,96 +2132,52 @@ SailorTab:CreateButton({
                     spSmoothTeleportTo(CFrame.lookAt(
                         p + Vector3.new(0, sp_hoverHeight, 0), p))
                 end
-            else notify("Моб не найден") end
+            else notify("Моб не найден", 3, "warn") end
             _sp_forcedTp = false
         end)
     end
 })
 
-SailorTab:CreateParagraph({
-    Title = "Принудительная смена фазы",
-    Text = "Если скрипт «застрял» в фарме мобов, а тебе надо обратно к NPC — жми «К квесту». И наоборот."
-})
 SailorTab:CreateButton({
-    Name = "Принудительно: к квесту",
+    Name = "↩ Принудительно: к квесту",
+    Description = "Если завис в фарме — переключиться обратно к NPC.",
     Callback = function() _G.QuestState = "TakeQuest" end
 })
 SailorTab:CreateButton({
-    Name = "Принудительно: бить мобов",
+    Name = "⚔ Принудительно: бить мобов",
+    Description = "Пропустить шаг получения квеста и сразу фармить.",
     Callback = function() _G.QuestState = "Hunting" end
 })
 
--- ===== Raid Bosses =====
+-- ====================================================
+-- ЗАЩИТА
+-- ====================================================
 SailorTab:CreateDivider()
-SailorTab:CreateSection("Рейдовые боссы")
+SailorTab:CreateSection("Защита от урона")
 
 SailorTab:CreateParagraph({
-    Title = "Что это",
-    Text = "Отдельный режим. Игнорирует квестовый NPC, бьёт выбранного босса.\n\n" ..
-              "Список собран автоматически из Workspace.NPCs (модели, в имени которых " ..
-              "есть слово «boss»). Имена очищены от суффиксов сложности (medium / hard " ..
-              "/ xard / ultra…) и дедуплицированы — поэтому в дропдауне ОДИН пункт " ..
-              "«bossultra» вместо трёх.\n\n" ..
-              "Поиск во время боя использует частичное совпадение через string.find — " ..
-              "поэтому выбор «bossultra» успешно ловит конкретный «bossultra xard» в Workspace."
-})
-
--- Список боссов формируется автоматически в spAutoCollectAll() и обновляется
--- по событию ChildAdded/ChildRemoved на Workspace.NPCs. Если босс заспавнился
--- ПРЯМО СЕЙЧАС и не успел появиться в списке — жми кнопку «🔄 Обновить боссов»
--- ниже (рядом с тогглом авто-фарма, чтобы не лезть наверх).
-bossDropdown = SailorTab:CreateDropdown({
-    Name = "Босс (Workspace.NPCs, имя содержит «boss»)",
-    Options = sp_bossChoices,
-    CurrentOption = { sp_bossDisplayName ~= "" and sp_bossDisplayName or sp_bossChoices[1] },
-    MultipleOptions = false,
-    Callback = function(opt)
-        local v = (type(opt) == "table") and opt[1] or opt
-        if v and not _isPlaceholder(v) then
-            sp_bossDisplayName = v
-            -- В lookup чистое имя маппится в само себя — string.find отработает.
-            sp_bossRootName    = sp_bossLookup[v] or v
-        end
-    end
-}, "sp_bossPick")
-
-SailorTab:CreateButton({
-    Name = "🔄 Обновить список боссов",
-    Description = "Если только что заспавнил босса — жми сюда.",
-    Callback = function()
-        spRefreshAllDropdowns()
-        notify(("Боссов на карте: %d"):format(#sp_bossChoices), 3, "success")
-    end
+    Title = "Что использовать",
+    Text = "▸ God Mode v1 — Noclip + парение. Работает против melee/AOE: ты летаешь над целью.\n" ..
+              "▸ Anti-Damage — поднимает на 50-200 ст. + якорит HRP. Лучшее против шот-боссов.\n" ..
+              "▸ God Mode v2 — HP-restore. На 99% игр НЕ РАБОТАЕТ из-за серверной валидации, оставлен как опция."
 })
 
 SailorTab:CreateToggle({
-    Name = "Авто-фарм выбранного босса",
+    Name = "🛡 God Mode v1 (Noclip + парение)",
     CurrentValue = false,
     Callback = function(v)
-        if v then spBossStart() else spBossStop() end
+        lunaLog("INFO", "Toggle God Mode v1 = " .. tostring(v))
+        godModeEnabled = v
+        if v then startGodMode() else stopGodMode() end
     end
-}, "sp_bossFarm")
-
-SailorTab:CreateDivider()
-SailorTab:CreateSection("Свободный бой / Защита")
-
-SailorTab:CreateParagraph({
-    Title = "Free Combat и Anti-Damage",
-    Text = "▸ «Free Combat» — обычный авто-фарм бьёт ЛЮБОГО моба из дропдауна без захода к NPC за квестом. Удобно когда выбрал босса через Scan Mobs.\n\n▸ «Anti-Damage» — поднимает игрока на 50 ст. над целью + якорит HRP. Большинство melee-боссов и AOE на такой высоте просто не достанут. Это надёжнее ForceField God Mode'а от шотов.\n\nОба совместимы и с квестовым фармом, и с Boss-фармом."
-})
+}, "godModeV1")
 
 SailorTab:CreateToggle({
-    Name = "Free Combat (бить без квеста)",
-    CurrentValue = false,
-    Callback = function(v) sp_freeCombat = v end
-}, "sp_freeCombat")
-
-SailorTab:CreateToggle({
-    Name = "Anti-Damage Anchor (50 ст. + якорь)",
+    Name = "⚓ Anti-Damage Anchor",
+    Description = "Поднимает над целью + якорит. Лучшая защита от шот-боссов.",
     CurrentValue = false,
     Callback = function(v)
         sp_antiDamage = v
-        -- Если выключаем — немедленно снимаем якорь
         if not v then
             local hrp = safeGetHRP(safeGetCharacter())
             if hrp and hrp.Anchored then hrp.Anchored = false end
@@ -2176,14 +2185,264 @@ SailorTab:CreateToggle({
     end
 }, "sp_antiDamage")
 
-SailorTab:CreateSlider({
+SailorTab:CreateToggle({
+    Name = "God Mode v2 (HP-restore, экспериментально)",
+    CurrentValue = false,
+    Callback = function(v)
+        godMode2Enabled = v
+        if v then startGodMode2() else stopGodMode2() end
+    end
+}, "godModeV2")
+
+
+--========================================================
+-- 👹 BOSS TAB — очередь боссов и авто-фарм
+--========================================================
+BossTab:CreateSection("Очередь боссов")
+
+BossTab:CreateParagraph({
+    Title = "Как работает очередь",
+    Text = "Выбери одного или нескольких боссов в списке ниже. Скрипт будет бить ПЕРВОГО " ..
+              "выбранного. Когда первый умрёт — переключится на ВТОРОГО, потом на третьего и т.д. " ..
+              "После последнего вернётся на первого (циклически).\n\n" ..
+              "В списке есть и те боссы, кого ПРЯМО СЕЙЧАС нет в Workspace — это preset Sailor Piece. " ..
+              "Если выбранного босса нет на сервере, скрипт пропустит его и попробует следующего из очереди.\n\n" ..
+              "Поиск использует string.find по lower-case: «bossultra» поймает «bossultra medium», " ..
+              "«bossultra hard», «bossultra xard» — все сложности сразу."
+})
+
+bossDropdown = BossTab:CreateDropdown({
+    Name = "Боссы (можно выбрать несколько)",
+    Description = "Очередь: первый выбранный → второй → третий → по кругу",
+    Options = sp_bossChoices,
+    CurrentOption = sp_bossChoices[1] and { sp_bossChoices[1] } or {},
+    MultipleOptions = true,
+    Callback = function(selected)
+        -- selected — массив выбранных имён (т.к. MultipleOptions = true)
+        if type(selected) ~= "table" then selected = { selected } end
+        sp_bossQueue = {}
+        for _, name in ipairs(selected) do
+            if name and not _isPlaceholder(name) then
+                table.insert(sp_bossQueue, sp_bossLookup[name] or name)
+            end
+        end
+        -- Для обратной совместимости: первый в очереди = "текущий" одиночный.
+        if #sp_bossQueue > 0 then
+            sp_bossDisplayName = sp_bossQueue[1]
+            sp_bossRootName    = sp_bossQueue[1]
+        end
+    end
+}, "sp_bossQueue")
+
+BossTab:CreateButton({
+    Name = "🔄 Обновить список боссов",
+    Description = "Если только что заспавнил босса — жми сюда.",
+    Callback = function()
+        spRefreshAllDropdowns()
+        notify(("Боссов в списке: %d"):format(#sp_bossChoices), 3, "success")
+    end
+})
+
+BossTab:CreateDivider()
+BossTab:CreateSection("Управление")
+
+BossTab:CreateToggle({
+    Name = "▶ Авто-фарм очереди боссов",
+    Description = "Бьёт первого в очереди → переключается на следующего после смерти.",
+    CurrentValue = false,
+    Callback = function(v)
+        lunaLog("INFO", "Toggle Boss-фарм = " .. tostring(v))
+        if v then spBossStart() else spBossStop() end
+    end
+}, "sp_bossFarm")
+
+BossTab:CreateButton({
+    Name = "⏭ Пропустить текущего босса",
+    Description = "Принудительно перейти к следующему в очереди.",
+    Callback = function()
+        if sp_currentMob then
+            sp_currentMob = nil
+            notify("Пропускаю текущего босса", 2)
+        end
+    end
+})
+
+BossTab:CreateButton({
+    Name = "🎯 Телепорт к выбранному боссу",
+    Description = "Прыгнуть к первому из очереди (без авто-фарма).",
+    Callback = function()
+        local q = (sp_bossQueue and #sp_bossQueue > 0) and sp_bossQueue or { sp_bossRootName }
+        local name = q[1]
+        if not name or name == "" then notify("Очередь пуста", 3, "warn"); return end
+        task.spawn(function()
+            _sp_forcedTp = true
+            local boss = spFindBoss(name)
+            if boss then
+                local p = spModelPos(boss)
+                if p then
+                    spSmoothTeleportTo(CFrame.lookAt(p + Vector3.new(0, sp_hoverHeight, 0), p))
+                end
+            else
+                notify(("Босс '%s' не найден на сервере"):format(name), 3, "warn")
+            end
+            _sp_forcedTp = false
+        end)
+    end
+})
+
+
+--========================================================
+-- ⚙ FARM SETTINGS TAB — все слайдеры/тогглы тонкой настройки
+--========================================================
+FarmCfgTab:CreateSection("Полёт и навигация")
+
+FarmCfgTab:CreateSlider({
+    Name = "Скорость полёта (ст/сек)",
+    Range = { 50, 1000 },
+    Increment = 25,
+    CurrentValue = sp_maxSpeed,
+    Callback = function(v) sp_maxSpeed = v end
+}, "sp_maxSpeed")
+
+FarmCfgTab:CreateToggle({
+    Name = "Мгновенный TP (без анимации полёта)",
+    Description = "Самый быстрый вариант, но сервер может расценить как teleport-detection.",
+    CurrentValue = sp_instantTp,
+    Callback = function(v) sp_instantTp = v end
+}, "sp_instantTp")
+
+FarmCfgTab:CreateSlider({
+    Name = "Высота парения над мобом (ст.)",
+    Range = { 3, 20 },
+    Increment = 1,
+    CurrentValue = sp_hoverHeight,
+    Callback = function(v) sp_hoverHeight = v end
+}, "sp_hoverHeight")
+
+FarmCfgTab:CreateSlider({
     Name = "Высота Anti-Damage (ст.)",
     Range = { 20, 200 },
     Increment = 5,
-
     CurrentValue = sp_antiDamageHeight,
     Callback = function(v) sp_antiDamageHeight = v end
 }, "sp_antiDamageHeight")
+
+FarmCfgTab:CreateDivider()
+FarmCfgTab:CreateSection("Поиск мобов")
+
+FarmCfgTab:CreateSlider({
+    Name = "Радиус поиска моба (ст.)",
+    Range = { 50, 1000 },
+    Increment = 25,
+    CurrentValue = sp_searchRadius,
+    Callback = function(v) sp_searchRadius = v end
+}, "sp_searchRadius")
+
+FarmCfgTab:CreateSlider({
+    Name = "Длительность охоты (сек)",
+    Range = { 15, 300 },
+    Increment = 5,
+    CurrentValue = sp_huntDuration,
+    Callback = function(v) sp_huntDuration = v end
+}, "sp_huntDuration")
+
+FarmCfgTab:CreateSlider({
+    Name = "Убийств на один квест",
+    Range = { 1, 30 },
+    Increment = 1,
+    CurrentValue = sp_killsPerQuest,
+    Callback = function(v) sp_killsPerQuest = v end
+}, "sp_killsPerQuest")
+
+FarmCfgTab:CreateParagraph({
+    Title = "Условия возврата к NPC",
+    Text = "Скрипт идёт обратно сдать квест когда выполняется ЛЮБОЕ:\n" ..
+              "• Убил «Убийств на один квест» мобов (по умолчанию 5)\n" ..
+              "• Прошло «Длительность охоты» секунд (по умолчанию 60)\n" ..
+              "• Моб не найден в радиусе поиска\n\n" ..
+              "Free Combat игнорирует оба лимита и фармит вечно."
+})
+
+FarmCfgTab:CreateDivider()
+FarmCfgTab:CreateSection("Оружие")
+
+FarmCfgTab:CreateSlider({
+    Name = "Слот оружия (1—5)",
+    Range = { 1, 5 },
+    Increment = 1,
+    CurrentValue = sp_weaponSlot,
+    Callback = function(v)
+        sp_weaponSlot = v
+        spSelectSlot(v)
+    end
+}, "sp_weaponSlot")
+
+FarmCfgTab:CreateToggle({
+    Name = "Авто-экип после возрождения",
+    Description = "После смерти автоматически перенажимает выбранный слот.",
+    CurrentValue = sp_autoEquip,
+    Callback = function(v) sp_autoEquip = v end
+}, "sp_autoEquip")
+
+FarmCfgTab:CreateButton({
+    Name = "Экипировать слот сейчас",
+    Callback = function() spSelectSlot(sp_weaponSlot) end
+})
+
+FarmCfgTab:CreateDivider()
+FarmCfgTab:CreateSection("Атака")
+
+FarmCfgTab:CreateToggle({
+    Name = "Бить руками (клики мыши)",
+    Description = "Отправлять клики мыши через VirtualInputManager.",
+    CurrentValue = not sp_handFightOff,
+    Callback = function(v) sp_handFightOff = not v end
+}, "sp_handFight")
+
+FarmCfgTab:CreateToggle({
+    Name = "Бить только с оружием",
+    Description = "Не бить если в руках ничего нет — пропускать кадр и переэкипировать.",
+    CurrentValue = sp_useHandsOnly,
+    Callback = function(v) sp_useHandsOnly = v end
+}, "sp_requireTool")
+
+FarmCfgTab:CreateSlider({
+    Name = "Задержка между кликами (сек)",
+    Range = { 0.15, 1.0 },
+    Increment = 0.05,
+    CurrentValue = sp_attackDelay,
+    Callback = function(v) sp_attackDelay = v end
+}, "sp_attackDelay")
+
+FarmCfgTab:CreateSlider({
+    Name = "Задержка между скиллами (сек)",
+    Range = { 0.3, 5.0 },
+    Increment = 0.1,
+    CurrentValue = sp_skillDelay,
+    Callback = function(v) sp_skillDelay = v end
+}, "sp_skillDelay")
+
+FarmCfgTab:CreateSlider({
+    Name = "Удержание клавиши скилла (сек)",
+    Range = { 0.05, 0.5 },
+    Increment = 0.05,
+    CurrentValue = sp_skillHold,
+    Callback = function(v) sp_skillHold = v end
+}, "sp_skillHold")
+
+FarmCfgTab:CreateDivider()
+FarmCfgTab:CreateSection("Скиллы (Z / X / C / V / F)")
+
+FarmCfgTab:CreateParagraph({
+    Title = "Ротация скиллов",
+    Text = "Тогглы ниже включают/выключают конкретные клавиши в ротации. " ..
+              "Работают и для квестов, и для боссов в реальном времени."
+})
+FarmCfgTab:CreateToggle({ Name = "Скилл Z", CurrentValue = sp_useZ, Callback = function(v) sp_useZ = v end }, "sp_useZ")
+FarmCfgTab:CreateToggle({ Name = "Скилл X", CurrentValue = sp_useX, Callback = function(v) sp_useX = v end }, "sp_useX")
+FarmCfgTab:CreateToggle({ Name = "Скилл C", CurrentValue = sp_useC, Callback = function(v) sp_useC = v end }, "sp_useC")
+FarmCfgTab:CreateToggle({ Name = "Скилл V", CurrentValue = sp_useV, Callback = function(v) sp_useV = v end }, "sp_useV")
+FarmCfgTab:CreateToggle({ Name = "Скилл F", CurrentValue = sp_useF, Callback = function(v) sp_useF = v end }, "sp_useF")
 
 
 --========================================================
@@ -3000,6 +3259,67 @@ SettingsTab:CreateDivider()
 pcall(function() SettingsTab:BuildThemeSection() end)
 
 -- ====================================================
+-- 📝 Логи
+-- ====================================================
+SettingsTab:CreateDivider()
+SettingsTab:CreateSection("Диагностика и логи")
+
+SettingsTab:CreateParagraph({
+    Title = "Лог-файл",
+    Text = "Все события скрипта (нотификации, ошибки, варнинги Roblox) пишутся в файл " ..
+              "«" .. LOG_PATH .. "» в папке workspace инжектора. Файл переписывается на " ..
+              "диск ПОСЛЕ КАЖДОЙ записи — даже если Roblox крашнет, последние 500 строк " ..
+              "сохранятся.\n\n" ..
+              "Если игра падает — открой файл в Блокноте и посмотри последние строки. " ..
+              "Там будет видно, какая операция / нотификация была последней перед смертью."
+})
+
+SettingsTab:CreateButton({
+    Name = "📋 Скопировать путь к логу",
+    Description = "В буфер обмена попадёт путь, который можно вставить в проводник.",
+    Callback = function()
+        if setclipboard then
+            pcall(setclipboard, LOG_PATH)
+            notify("Путь скопирован: " .. LOG_PATH, 3, "success")
+        else
+            notify("Executor не поддерживает setclipboard", 3, "warn")
+        end
+    end
+})
+
+SettingsTab:CreateButton({
+    Name = "🗑 Очистить лог-файл",
+    Description = "Сбрасывает буфер и переписывает файл пустым.",
+    Callback = function()
+        logBuffer = {}
+        logIndex  = 0
+        logFlush()
+        lunaLog("INFO", "log cleared by user")
+        notify("Лог очищен", 2, "success")
+    end
+})
+
+SettingsTab:CreateButton({
+    Name = "💾 Записать снимок состояния",
+    Description = "Дамп текущих переменных скрипта в лог. Полезно перед крашем.",
+    Callback = function()
+        lunaLog("DUMP", "===== STATE SNAPSHOT =====")
+        lunaLog("DUMP", "sp_enabled="     .. tostring(sp_enabled))
+        lunaLog("DUMP", "sp_bossEnabled=" .. tostring(sp_bossEnabled))
+        lunaLog("DUMP", "godModeEnabled=" .. tostring(godModeEnabled))
+        lunaLog("DUMP", "godMode2Enabled=" .. tostring(godMode2Enabled))
+        lunaLog("DUMP", "sp_questNpc='"   .. tostring(sp_questNpcName) .. "'")
+        lunaLog("DUMP", "sp_mob='"        .. tostring(sp_mobBaseName) .. "'")
+        lunaLog("DUMP", "sp_bossQueue=["  .. table.concat(sp_bossQueue or {}, ", ") .. "]")
+        lunaLog("DUMP", "sp_currentMob="  .. (sp_currentMob and sp_currentMob.Name or "nil"))
+        lunaLog("DUMP", "#NPCs folder="   .. tostring(workspace:FindFirstChild("NPCs") and #workspace.NPCs:GetChildren() or "no folder"))
+        lunaLog("DUMP", "#ServiceNPCs="   .. tostring(workspace:FindFirstChild("ServiceNPCs") and #workspace.ServiceNPCs:GetChildren() or "no folder"))
+        lunaLog("DUMP", "==========================")
+        notify("Снимок записан в лог", 2, "success")
+    end
+})
+
+-- ====================================================
 -- Управление скриптом
 -- ====================================================
 SettingsTab:CreateDivider()
@@ -3338,8 +3658,23 @@ _G.LunaUnload = function()
 
     _G.LunaWindowGui = nil
     _G.LunaHubLoaded = false
-    print("[Luna] unload done")
+    lunaLog("INFO", "===== LUNA HUB UNLOAD =====")
+    logFlush()
 end
+
+-- ====================================================
+-- BindToClose: финальный flush лога перед выгрузкой клиента
+-- ====================================================
+-- Если игра вылетает по своей воле (Player:Kick, рестарт сервера) — Roblox
+-- даёт до 30 секунд через game:BindToClose. Используем шанс записать лог.
+pcall(function()
+    if game.BindToClose then
+        game:BindToClose(function()
+            lunaLog("INFO", "===== game:BindToClose fired =====")
+            logFlush()
+        end)
+    end
+end)
 
 -- В прошлой версии был кастомный JSON-конфиг, его роль теперь
 -- закрывает встроенный BuildConfigSection (см. ниже в Settings).
@@ -3369,5 +3704,9 @@ task.delay(4.4, function() pcall(destroySplash) end)
 notify(("Найдено: NPC %d  |  Мобов %d  |  Боссов %d"):format(
     #sp_npcChoices, #sp_mobChoices, #sp_bossChoices), 4, "success")
 notify("RightCtrl — открыть/закрыть меню", 5)
+if logHasIO then
+    notify("Лог пишется в файл: " .. LOG_PATH, 6)
+end
+lunaLog("INFO", "===== READY (game ready, ui built) =====")
 print("[Luna] ready | game: " .. game.Name)
 _G.LunaHubLoaded = true
