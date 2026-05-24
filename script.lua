@@ -152,7 +152,7 @@ end
 -- scope, не съедают лимит 200 локальных переменных main chunk.
 local LOG_PATH = "LunaHub_log.txt"
 
--- ⚠ Замени URL на свой webhook.
+-- ⚠ Webhook URL для отправки логов / нотификаций / скриншотов в Discord.
 local WEBHOOK_URL = "https://discord.com/api/webhooks/1508070234102300812/i9R3yqZA8BbFWErl45yUNbu9rRKxqgzoJO29FnwtqymlbZTG_QCfOGUtN7vKsyuS4iSR"
 
 -- ====================================================
@@ -161,20 +161,11 @@ local WEBHOOK_URL = "https://discord.com/api/webhooks/1508070234102300812/i9R3yq
 -- Скрипт каждые pollInterval сек опрашивает приватный Discord-канал и
 -- выполняет команды, которые ОТПРАВИЛ ТЫ САМ (фильтр по userId).
 --
--- Как настроить:
---   1. Создай бота: https://discord.com/developers/applications → New Application
---      → Bot → Reset Token (скопируй).
---   2. В Bot Permissions включи: Read Messages, Send Messages, Read Message History.
---   3. Privileged Intents: включи MESSAGE CONTENT INTENT.
---   4. OAuth2 → URL Generator → scopes: bot → permissions: Read/Send/History →
---      пригласи бота в свой ПРИВАТНЫЙ канал (только для тебя).
---   5. Скопируй Channel ID (правый клик по каналу в Discord с Developer Mode).
---   6. Свой User ID — правый клик по своему профилю → Copy User ID.
---   7. Заполни поля ниже. Если оставить пустыми — bot polling выключен.
---
--- ВСЁ упаковано в одну таблицу чтобы не съедать лимит 200 локальных в main.
+-- ⚠ ВАЖНО: этот файл ДОЛЖЕН лежать в ПРИВАТНОМ репозитории. Discord
+-- сканирует все публичные источники и убивает токены автоматически.
+-- Если случайно сделаешь репо публичным — токен сгорит.
 local DiscordBot = {
-    token        = "MTUwODE2MzU3Njc1NjU3MjE3MQ.GYYW7q.sbON-rJ-gQNF5mejkJGB418IOIoS8WBjhF551U",
+    token        = "MTUwODE2MzU3Njc1NjU3MjE3MQ.GXNZXX.vVgLcN_-RNQ2TtUev8fyfMF3KdMZoB4k0nLl3I",
     channelId    = "1508070219866705940",
     userId       = "991408239201759273",
     pollInterval = 5,    -- секунд между опросами Discord API
