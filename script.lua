@@ -133,9 +133,34 @@ local function notify(msg, dur, kind)
     print("[Luna] " .. tostring(msg))
 end
 
--- Хелпер: спрятать/показать Luna UI (Luna не имеет публичного :SetVisibility,
--- поэтому переключаем .Enabled на ScreenGui "Luna UI").
+-- Хелпер: спрятать/показать Luna UI.
+-- Luna хранит "стекло" блюра в workspace.CurrentCamera.LunaBlur (Folder с
+-- BasePart-плоскостями) + DepthOfFieldEffect в Lighting с именем "DPT_<id>".
+-- При закрытии меню эти 3D-плоскости остаются висеть на экране и затемняют
+-- картинку. Поэтому их тоже скрываем.
 local lunaVisible = true
+local function _lunaToggleBlurArtifacts(visible)
+    pcall(function()
+        local cam = workspace.CurrentCamera
+        if cam then
+            local blur = cam:FindFirstChild("LunaBlur")
+            if blur then
+                for _, c in ipairs(blur:GetDescendants()) do
+                    if c:IsA("BasePart") then
+                        c.Transparency = visible and c.Transparency or 1
+                        c.LocalTransparencyModifier = visible and 0 or 1
+                    end
+                end
+            end
+        end
+        for _, d in ipairs(game:GetService("Lighting"):GetChildren()) do
+            if d:IsA("DepthOfFieldEffect") and d.Name:sub(1, 4) == "DPT_" then
+                d.Enabled = visible and true or false
+            end
+        end
+    end)
+end
+
 local function lunaSetVisibility(state)
     lunaVisible = state and true or false
     pcall(function()
@@ -149,6 +174,7 @@ local function lunaSetVisibility(state)
             end
         end
     end)
+    _lunaToggleBlurArtifacts(lunaVisible)
 end
 local function lunaIsVisible() return lunaVisible end
 
@@ -632,16 +658,17 @@ do
     Window = win
 end
 
--- ===== Home Tab (встроенный дашборд Luna) =====
--- Показывает аватар игрока, исполнитель, FPS/пинг/регион/друзей, кнопку Discord.
--- Полезно как welcome-экран.
-pcall(function()
-    Window:CreateHomeTab({
-        Icon              = 1,
-        SupportedExecutors = { "Synapse", "Solara", "Wave", "AWP", "Krnl", "Delta", "Xeno", "Velocity" },
-        DiscordInvite     = "nebula", -- placeholder, замени на свою
-    })
-end)
+-- ===== Home Tab отключён =====
+-- Luna Home Tab вызывает Players:GetFriendsAsync в бесконечном while-loop без
+-- троттлинга — это спамит HTTP запросами и Roblox возвращает 429 + потенциально
+-- крашит игру. Включай только если очень надо.
+-- pcall(function()
+--     Window:CreateHomeTab({
+--         Icon = 1,
+--         SupportedExecutors = { "Synapse", "Solara", "Wave", "AWP", "Krnl" },
+--         DiscordInvite = "nebula",
+--     })
+-- end)
 
 -- ===== Табы =====
 -- ВАЖНО: используем ImageSource = "Material" — Lucide для табов в текущей версии
@@ -700,8 +727,9 @@ local sp_autoEquip  = true
 
 -- Hover/God Mode
 local sp_hoverHeight = 7
-local sp_maxSpeed    = 110
-local sp_stepRate    = 30
+local sp_maxSpeed    = 350    -- студов в секунду при плавном перелёте
+local sp_stepRate    = 60     -- частота кадров полёта (выше = плавнее)
+local sp_instantTp   = false  -- true = мгновенный telepout без интерполяции
 
 -- Глобал состояния
 _G.QuestState = _G.QuestState or "TakeQuest"   -- "TakeQuest" | "Hunting"
@@ -1027,13 +1055,18 @@ local function spFindQuestNpc(npcName)
 end
 
 -- ====================================================
--- Плавный TP с лимитом скорости
+-- Плавный TP с лимитом скорости (или мгновенный, если sp_instantTp = true)
 -- ====================================================
 local _sp_forcedTp = false
 local function spSmoothTeleportTo(targetCFrame)
     local char = safeGetCharacter()
     local hrp  = safeGetHRP(char)
     if not hrp then return end
+    -- Мгновенный режим: одна запись CFrame и выход.
+    if sp_instantTp then
+        pcall(function() hrp.CFrame = targetCFrame end)
+        return
+    end
     local startCF = hrp.CFrame
     local dist = (targetCFrame.Position - startCF.Position).Magnitude
     if dist < 0.5 then
@@ -1742,37 +1775,86 @@ mobDropdown = SailorTab:CreateDropdown({
     end
 }, "sp_mob")
 
+-- Хелпер: переcобрать списки и обновить все три дропдауна сразу.
+-- forward-decl: dropdown'ы создаются ниже, поэтому используем upvalue.
+local function spRefreshAllDropdowns()
+    spAutoCollectAll()
+    if npcDropdown and npcDropdown.Set then
+        pcall(function()
+            npcDropdown:Set({ Options = sp_npcChoices, CurrentOption = { sp_npcChoices[1] } })
+        end)
+    end
+    if mobDropdown and mobDropdown.Set then
+        pcall(function()
+            mobDropdown:Set({ Options = sp_mobChoices, CurrentOption = { sp_mobChoices[1] } })
+        end)
+    end
+    if bossDropdown and bossDropdown.Set then
+        pcall(function()
+            bossDropdown:Set({ Options = sp_bossChoices, CurrentOption = { sp_bossChoices[1] } })
+        end)
+    end
+    if not _isPlaceholder(sp_npcChoices[1]) then
+        sp_questNpcName = _resolveNpcCode(sp_npcChoices[1]) or sp_questNpcName
+    end
+    if not _isPlaceholder(sp_mobChoices[1]) then
+        sp_mobBaseName = _resolveMobCode(sp_mobChoices[1]) or sp_mobBaseName
+    end
+    if not _isPlaceholder(sp_bossChoices[1]) then
+        sp_bossDisplayName = sp_bossChoices[1]
+        sp_bossRootName    = sp_bossLookup[sp_bossDisplayName] or sp_bossDisplayName
+    end
+end
+
 -- Кнопка ручного refresh — на случай если по ходу игры в Workspace.NPCs
 -- появились новые модели (новая зона / спавн босса).
 SailorTab:CreateButton({
     Name = "🔄 Пересобрать списки (ручной refresh)",
     Description = "Обнови если в локации появились новые мобы/NPC после загрузки",
     Callback = function()
-        spAutoCollectAll()
-        if npcDropdown and npcDropdown.Set then
-            pcall(function() npcDropdown:Set({ Options = sp_npcChoices, CurrentOption = { sp_npcChoices[1] } }) end)
-        end
-        if mobDropdown and mobDropdown.Set then
-            pcall(function() mobDropdown:Set({ Options = sp_mobChoices, CurrentOption = { sp_mobChoices[1] } }) end)
-        end
-        if bossDropdown and bossDropdown.Set then
-            pcall(function() bossDropdown:Set({ Options = sp_bossChoices, CurrentOption = { sp_bossChoices[1] } }) end)
-        end
-        -- Подставляем дефолты для активных переменных
-        if not _isPlaceholder(sp_npcChoices[1]) then
-            sp_questNpcName = _resolveNpcCode(sp_npcChoices[1]) or sp_questNpcName
-        end
-        if not _isPlaceholder(sp_mobChoices[1]) then
-            sp_mobBaseName = _resolveMobCode(sp_mobChoices[1]) or sp_mobBaseName
-        end
-        if not _isPlaceholder(sp_bossChoices[1]) then
-            sp_bossDisplayName = sp_bossChoices[1]
-            sp_bossRootName    = sp_bossLookup[sp_bossDisplayName] or sp_bossDisplayName
-        end
+        spRefreshAllDropdowns()
         notify(("NPC: %d  |  Мобов: %d  |  Боссов: %d")
-            :format(#sp_npcChoices, #sp_mobChoices, #sp_bossChoices))
+            :format(#sp_npcChoices, #sp_mobChoices, #sp_bossChoices),
+            3, "success")
     end
 })
+
+-- ====================================================
+-- АВТОМАТИЧЕСКИЙ watcher на новые/удалённые модели
+-- ====================================================
+-- Ловим ChildAdded/ChildRemoved на Workspace.NPCs и Workspace.ServiceNPCs.
+-- Дебаунсим 0.5сек, чтобы при массовом respawn'е не дёргать UI 100 раз подряд.
+do
+    local pendingRefresh = false
+    local function scheduleRefresh()
+        if pendingRefresh then return end
+        pendingRefresh = true
+        task.delay(0.5, function()
+            pendingRefresh = false
+            pcall(spRefreshAllDropdowns)
+        end)
+    end
+
+    local function bind(folder)
+        if not folder then return end
+        track(folder.ChildAdded:Connect(function(c)
+            if c:IsA("Model") then scheduleRefresh() end
+        end))
+        track(folder.ChildRemoved:Connect(function(c)
+            if c:IsA("Model") then scheduleRefresh() end
+        end))
+    end
+
+    bind(workspace:FindFirstChild("NPCs"))
+    bind(workspace:FindFirstChild("ServiceNPCs"))
+    -- Если папок ещё нет — слушаем их создание
+    track(workspace.ChildAdded:Connect(function(c)
+        if c.Name == "NPCs" or c.Name == "ServiceNPCs" then
+            bind(c)
+            scheduleRefresh()
+        end
+    end))
+end
 
 SailorTab:CreateParagraph({
     Title = "Об авто-сборе",
@@ -1948,6 +2030,23 @@ SailorTab:CreateToggle({
 SailorTab:CreateDivider()
 SailorTab:CreateSection("Запуск")
 
+-- Скорость перелёта между точками. Раньше дефолт был 110 ст/сек — летел медленно;
+-- теперь 350. Слайдер в UI чтобы можно было замедлить если игра стучит anti-cheat'ом.
+SailorTab:CreateSlider({
+    Name = "Скорость полёта (ст/сек)",
+    Range = { 50, 1000 },
+    Increment = 25,
+    CurrentValue = sp_maxSpeed,
+    Callback = function(v) sp_maxSpeed = v end
+}, "sp_maxSpeed")
+
+SailorTab:CreateToggle({
+    Name = "Мгновенный TP (без анимации полёта)",
+    Description = "Самый быстрый вариант, но сервер может расценить как teleport-detection.",
+    CurrentValue = sp_instantTp,
+    Callback = function(v) sp_instantTp = v end
+}, "sp_instantTp")
+
 SailorTab:CreateToggle({
     Name = "Авто-фарм (квест)",
     CurrentValue = false,
@@ -2014,9 +2113,10 @@ SailorTab:CreateParagraph({
               "поэтому выбор «bossultra» успешно ловит конкретный «bossultra xard» в Workspace."
 })
 
--- Список боссов формируется автоматически в spAutoCollectAll() — берётся из
--- sp_bossChoices / sp_bossLookup. Никаких ручных скан-кнопок: все актуальные
--- боссы карты уже в дропдауне на момент запуска.
+-- Список боссов формируется автоматически в spAutoCollectAll() и обновляется
+-- по событию ChildAdded/ChildRemoved на Workspace.NPCs. Если босс заспавнился
+-- ПРЯМО СЕЙЧАС и не успел появиться в списке — жми кнопку «🔄 Обновить боссов»
+-- ниже (рядом с тогглом авто-фарма, чтобы не лезть наверх).
 bossDropdown = SailorTab:CreateDropdown({
     Name = "Босс (Workspace.NPCs, имя содержит «boss»)",
     Options = sp_bossChoices,
@@ -2031,6 +2131,15 @@ bossDropdown = SailorTab:CreateDropdown({
         end
     end
 }, "sp_bossPick")
+
+SailorTab:CreateButton({
+    Name = "🔄 Обновить список боссов",
+    Description = "Если только что заспавнил босса — жми сюда.",
+    Callback = function()
+        spRefreshAllDropdowns()
+        notify(("Боссов на карте: %d"):format(#sp_bossChoices), 3, "success")
+    end
+})
 
 SailorTab:CreateToggle({
     Name = "Авто-фарм выбранного босса",
@@ -3212,6 +3321,20 @@ _G.LunaUnload = function()
     pcall(function() if tracerGui then tracerGui:Destroy() end end)
     pcall(destroySplash)
     pcall(function() Luna:Destroy() end)
+
+    -- Зачищаем блюр-артефакты Luna (3D-плоскости в Camera.LunaBlur + DOF в Lighting)
+    pcall(function()
+        local cam = workspace.CurrentCamera
+        if cam then
+            local blur = cam:FindFirstChild("LunaBlur")
+            if blur then blur:Destroy() end
+        end
+        for _, d in ipairs(game:GetService("Lighting"):GetChildren()) do
+            if d:IsA("DepthOfFieldEffect") and d.Name:sub(1, 4) == "DPT_" then
+                d:Destroy()
+            end
+        end
+    end)
 
     _G.LunaWindowGui = nil
     _G.LunaHubLoaded = false
