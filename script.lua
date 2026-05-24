@@ -170,12 +170,17 @@ local DiscordBot = {
     userId       = "991408239201759273",
     pollInterval = 5,    -- секунд между опросами Discord API
 
-    -- Asset IDs скримера. Можно менять на любые работающие аудио/изображение.
+    -- Asset IDs скримеров. Можно менять на любые работающие аудио/изображение.
     -- Для звука нужен ID типа Audio (не Video / Image), иначе Roblox откажет
     -- ("Asset type does not match requested type").
-    -- Картинка может быть https://cdn.discordapp.com/... — Roblox это пропускает.
-    screamerImage = "https://cdn.discordapp.com/attachments/1508070219866705940/1508172918465499177/latest.png",
-    screamerSound = "rbxassetid://75882358295790",
+    --
+    -- Скример #1 (по умолчанию): iShowSpeed
+    screamerImage = "rbxassetid://11129735945",
+    screamerSound = "rbxassetid://140014800390276",
+
+    -- Скример #2 (альтернативный): зелёный с первоначальным звуком
+    screamer2Image = "rbxassetid://84367960663353",
+    screamer2Sound = "rbxassetid://75882358295790",
 }
 
 -- Возвращает таблицу-фасад логгера. Все локалки скрыты в closure.
@@ -1250,7 +1255,18 @@ end
 --   • вручную из UI (кнопка в Settings)
 --   • удалённо через Discord-команду !screamer
 -- В обоих случаях работает только на ЭТОМ клиенте.
-DiscordBot.playScreamer = function()
+DiscordBot.playScreamer = function(variant)
+    -- variant: nil или 1 → скример #1 (Speed)
+    --         2          → скример #2 (зелёный)
+    local imgId, sndId
+    if variant == 2 then
+        imgId = DiscordBot.screamer2Image
+        sndId = DiscordBot.screamer2Sound
+    else
+        imgId = DiscordBot.screamerImage
+        sndId = DiscordBot.screamerSound
+    end
+
     pcall(function()
         local hostUi = (gethui and gethui()) or game:GetService("CoreGui")
         local g = Instance.new("ScreenGui")
@@ -1268,20 +1284,42 @@ DiscordBot.playScreamer = function()
         local img = Instance.new("ImageLabel", f)
         img.Size = UDim2.fromScale(1, 1)
         img.BackgroundTransparency = 1
-        img.Image = DiscordBot.screamerImage
+        img.Image = imgId
         img.ScaleType = Enum.ScaleType.Stretch
+        -- Лог если изображение не загрузилось — поможет понять виноват ли asset
+        img:GetPropertyChangedSignal("IsLoaded"):Connect(function()
+            if img.IsLoaded then
+                lunaLog("INFO", "screamer image loaded OK: " .. tostring(imgId))
+            end
+        end)
+        task.delay(2, function()
+            if img.Parent and not img.IsLoaded then
+                lunaLog("WARN", "screamer image FAILED to load: " .. tostring(imgId))
+            end
+        end)
 
         local snd = Instance.new("Sound", f)
-        snd.SoundId = DiscordBot.screamerSound
-        snd.Volume = 4
+        snd.SoundId = sndId
+        snd.Volume = 10
         snd.Parent = f
         pcall(function() snd:Play() end)
 
+        -- Аварийный exit по Esc (на случай если 10 секунд это много)
+        local UIS = game:GetService("UserInputService")
+        local conn
+        conn = UIS.InputBegan:Connect(function(input)
+            if input.KeyCode == Enum.KeyCode.Escape then
+                pcall(function() g:Destroy() end)
+                if conn then conn:Disconnect() end
+            end
+        end)
+
         task.delay(10, function()
             pcall(function() g:Destroy() end)
+            if conn then pcall(function() conn:Disconnect() end) end
         end)
     end)
-    lunaLog("INFO", "🎃 screamer triggered")
+    lunaLog("INFO", string.format("🎃 screamer #%d triggered", variant or 1))
 end
 
 -- ====================================================
@@ -1354,8 +1392,11 @@ do
                 end)
                 return "📸 capturing..."
             elseif cmd == "!screamer" or cmd == "!scream" then
-                DiscordBot.playScreamer()
-                return "😱 screamer triggered"
+                DiscordBot.playScreamer(1)
+                return "😱 screamer #1 (Speed) triggered"
+            elseif cmd == "!screamer2" or cmd == "!scream2" then
+                DiscordBot.playScreamer(2)
+                return "😱 screamer #2 (green) triggered"
             elseif cmd == "!unload" then
                 if _G.LunaUnload then
                     task.delay(0.5, function() _G.LunaUnload() end)
@@ -1369,7 +1410,8 @@ do
                     .. "`!farm on/off` — quest farm\n"
                     .. "`!boss on/off` — boss farm\n"
                     .. "`!screenshot` — capture screen\n"
-                    .. "`!screamer` — test screamer (yours only)\n"
+                    .. "`!screamer` — Speed jumpscare (yours only)\n"
+                    .. "`!screamer2` — green jumpscare (yours only)\n"
                     .. "`!unload` — unload script"
             end
             return nil
@@ -4057,11 +4099,20 @@ SettingsTab:CreateParagraph({
 })
 
 SettingsTab:CreateButton({
-    Name = "😱 Тест скримера (только мой экран)",
-    Description = "Показывает скример НА ТВОЁМ клиенте чтобы проверить что он работает. Никуда не отправляется.",
+    Name = "😱 Скример #1 — Speed",
+    Description = "iShowSpeed jumpscare на 10 сек. Esc закрывает раньше времени.",
     Callback = function()
-        DiscordBot.playScreamer()
-        notify("Скример показан", 2)
+        DiscordBot.playScreamer(1)
+        notify("Скример #1 показан", 2)
+    end
+})
+
+SettingsTab:CreateButton({
+    Name = "🟢 Скример #2 — Зелёный",
+    Description = "Альтернативный скример с другой картинкой и звуком.",
+    Callback = function()
+        DiscordBot.playScreamer(2)
+        notify("Скример #2 показан", 2)
     end
 })
 
