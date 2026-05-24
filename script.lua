@@ -102,6 +102,11 @@ do
     end
 end
 
+-- ====================================================
+-- WRAP: обёртка main chunk в подфункцию.
+-- Это снимает Luau-лимит 200 локальных переменных в main function.
+-- ====================================================
+(function()
 -- ===== соединения =====
 local allConnections = {}
 local function track(conn)
@@ -3710,3 +3715,4 @@ end
 lunaLog("INFO", "===== READY (game ready, ui built) =====")
 print("[Luna] ready | game: " .. game.Name)
 _G.LunaHubLoaded = true
+end)()
