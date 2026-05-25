@@ -1698,8 +1698,28 @@ end
 HomeTab:CreateSection("Модули")
 
 local MODULE_SOURCES = {
-    sailor_piece = "https://raw.githubusercontent.com/Alkaesh/ratnikforbyitself123/refs/heads/main/sailor_piece_module.lua?token=GHSAT0AAAAAAD4VVIYATHBLEZYLOAGOPSEW2QUTS5Q",
+    -- ВАЖНО: ссылка БЕЗ ?token=... — токен GitHub OAuth истекает за пару часов
+    -- и сервер начинает отдавать 404 HTML, который потом ломает loadstring
+    -- ("Expected identifier ... got '404'"). Используем чистый raw.
+    sailor_piece = "https://raw.githubusercontent.com/Alkaesh/ratnikforbyitself123/refs/heads/main/sailor_piece_module.lua",
 }
+
+-- Проверяем что HTTP-ответ это похоже на Lua, а не HTML страничка с ошибкой.
+-- GitHub Raw на 404 возвращает текст "404: Not Found", иногда HTML с <!DOCTYPE>.
+-- В обоих случаях loadstring падает с непонятным "Expected identifier".
+local function _isHtmlOrError(src)
+    if type(src) ~= "string" then return true end
+    if #src < 16 then return true end
+    local trimmed = src:match("^%s*(.-)%s*$") or src
+    local first = trimmed:sub(1, 200):lower()
+    if first:find("^<!doctype") or first:find("^<html")
+        or first:find("^404") or first:find("not found")
+        or first:find("^{") and first:find("\"message\"")
+    then
+        return true
+    end
+    return false
+end
 
 local function loadModule(name, url)
     if _G.LunaHub.modules[name] then
@@ -1713,6 +1733,14 @@ local function loadModule(name, url)
         if not ok then
             notify("Ошибка загрузки: " .. tostring(source), 5, "error")
             lunaLog("ERROR", "module fetch failed: " .. tostring(source))
+            return
+        end
+        if _isHtmlOrError(source) then
+            -- Серверу не нравится URL: 404 / приватный репо / истёкший токен.
+            -- Показываем первые 80 символов ответа в логе чтобы было видно что вернулось.
+            local preview = (source or ""):sub(1, 80):gsub("%s+", " ")
+            notify("Сервер вернул не-Lua ответ. Проверь URL модуля.", 6, "error")
+            lunaLog("ERROR", "module fetch returned non-lua: " .. preview)
             return
         end
         local fn, err = loadstring(source)
@@ -3132,8 +3160,6 @@ end
 -- Убираем splash через 2.2 сек (совпадает с финишем анимации прогресс-бара)
 task.delay(4.4, function() pcall(destroySplash) end)
 
-notify(("Найдено: NPC %d  |  Мобов %d  |  Боссов %d"):format(
-    #sp_npcChoices, #sp_mobChoices, #sp_bossChoices), 4, "success")
 notify("RightCtrl — открыть/закрыть меню", 5)
 if Log.hasIO() then
     notify("Лог пишется в файл: " .. LOG_PATH, 6)
