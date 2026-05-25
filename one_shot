@@ -1,1 +1,395 @@
+--========================================================
+-- ONE SHOT KILL — STANDALONE TEST
+--========================================================
+-- Самодостаточный скрипт для тестирования one-shot механики
+-- БЕЗ Luna Hub. Просто loadstring — и появляется маленькая GUI.
+--
+-- Алгоритм:
+--   1) Хукаем __namecall и ловим ВСЕ FireServer / InvokeServer вызовы.
+--   2) Когда юзер бьёт сам (нажимает ЛКМ по мобу), мы видим какой Remote
+--      и какие args улетели на сервер — записываем последние 5 в журнал.
+--   3) Кнопка "Spam Last" — берёт самый свежий замеченный комбатовский
+--      Remote и фаерит его N раз с теми же args.
+--   4) Кнопка "Kill Nearest" — то же самое + подменяет в args ближайшего
+--      моба (если в args есть Model с Humanoid).
+--
+-- ИНСТРУКЦИЯ:
+--   1) Запусти этот скрипт.
+--   2) ВАЖНО: подойди к мобу и УДАРЬ его сам один раз. Без этого spy не
+--      успевает поймать формат args — у one-shot не будет шаблона.
+--   3) Нажми "Show Last" — увидишь в консоли что именно ушло на сервер.
+--   4) Нажми "Kill Nearest" — должно ваншотнуть.
+--========================================================
+
+if _G.OneShotTestLoaded then
+    warn("[OneShotTest] уже запущен")
+    return
+end
+_G.OneShotTestLoaded = true
+
+local Players           = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UIS               = game:GetService("UserInputService")
+local LocalPlayer       = Players.LocalPlayer
+
+-- ====================================================
+-- Журнал перехваченных Remote-вызовов
+-- ====================================================
+-- Храним последние 8 вызовов, чтобы можно было выбрать какой replay'ить.
+-- Имя поля: { remote = ev, method = "FireServer", args = {...}, count = N, ts = tick() }
+local hitJournal       = {}
+local MAX_JOURNAL      = 8
+-- Ключевые слова, по которым считаем что Remote относится к комбату.
+-- Если ни одно не совпадает — игнорим (не засоряем журнал чатом / тиками / etc.)
+local COMBAT_KEYWORDS = {
+    "hit", "damage", "attack", "combat", "weapon", "swing", "strike",
+    "skill", "ability", "fire", "shoot", "bullet", "blade", "slash",
+}
+
+local function _looksLikeCombat(remote)
+    if not remote or not remote.Parent then return false end
+    local n = remote.Name:lower()
+    for _, kw in ipairs(COMBAT_KEYWORDS) do
+        if n:find(kw, 1, true) then return true end
+    end
+    -- Также любим всё внутри *.CombatSystem.*
+    local p = remote.Parent
+    while p and p ~= game do
+        local pn = p.Name:lower()
+        if pn:find("combat", 1, true) or pn:find("hit", 1, true) then return true end
+        p = p.Parent
+    end
+    return false
+end
+
+local function _pushJournal(entry)
+    table.insert(hitJournal, 1, entry)
+    if #hitJournal > MAX_JOURNAL then table.remove(hitJournal) end
+end
+
+-- ====================================================
+-- __namecall spy
+-- ====================================================
+local spyHooked = false
+
+local function installSpy()
+    if spyHooked then return true end
+
+    local hookmm    = rawget(getfenv(), "hookmetamethod")
+    local getrawmt  = rawget(getfenv(), "getrawmetatable")
+    local setreadon = rawget(getfenv(), "setreadonly")
+
+    if hookmm then
+        local ok, err = pcall(function()
+            local oldNamecall
+            oldNamecall = hookmm(game, "__namecall", function(self, ...)
+                local method = getnamecallmethod and getnamecallmethod() or ""
+                if (method == "FireServer"   or method == "fireServer"
+                    or method == "InvokeServer" or method == "invokeServer")
+                    and typeof(self) == "Instance"
+                    and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction"))
+                    and _looksLikeCombat(self)
+                then
+                    local args = table.pack(...)
+                    _pushJournal({
+                        remote = self, method = method,
+                        args = args, count = args.n, ts = tick(),
+                    })
+                end
+                return oldNamecall(self, ...)
+            end)
+        end)
+        if ok then
+            spyHooked = true
+            print("[OneShotTest] spy: hookmetamethod OK")
+            return true
+        else
+            warn("[OneShotTest] hookmetamethod failed: " .. tostring(err))
+        end
+    end
+
+    if getrawmt and setreadon then
+        local ok, err = pcall(function()
+            local mt = getrawmt(game)
+            local oldNamecall = mt.__namecall
+            setreadon(mt, false)
+            mt.__namecall = function(self, ...)
+                local method = getnamecallmethod and getnamecallmethod() or ""
+                if (method == "FireServer"   or method == "fireServer"
+                    or method == "InvokeServer" or method == "invokeServer")
+                    and typeof(self) == "Instance"
+                    and (self:IsA("RemoteEvent") or self:IsA("RemoteFunction"))
+                    and _looksLikeCombat(self)
+                then
+                    local args = table.pack(...)
+                    _pushJournal({
+                        remote = self, method = method,
+                        args = args, count = args.n, ts = tick(),
+                    })
+                end
+                return oldNamecall(self, ...)
+            end
+            setreadon(mt, true)
+        end)
+        if ok then
+            spyHooked = true
+            print("[OneShotTest] spy: getrawmetatable OK")
+            return true
+        else
+            warn("[OneShotTest] getrawmetatable failed: " .. tostring(err))
+        end
+    end
+
+    warn("[OneShotTest] executor НЕ поддерживает хуки — spy недоступен")
+    return false
+end
+
+-- ====================================================
+-- Поиск ближайшего моба
+-- ====================================================
+local function findNearestMob()
+    local char = LocalPlayer.Character
+    local hrp  = char and char:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil end
+    local origin = hrp.Position
+
+    local folder = workspace:FindFirstChild("NPCs")
+    if not folder then
+        warn("[OneShotTest] workspace.NPCs не найден")
+        return nil
+    end
+
+    local best, bestDist = nil, math.huge
+    for _, m in ipairs(folder:GetChildren()) do
+        if m:IsA("Model") and m ~= char then
+            local hum = m:FindFirstChildOfClass("Humanoid")
+            local part = m:FindFirstChild("HumanoidRootPart")
+                or m:FindFirstChild("Torso") or m.PrimaryPart
+            if hum and hum.Health > 0 and part then
+                local d = (part.Position - origin).Magnitude
+                if d < bestDist then bestDist, best = d, m end
+            end
+        end
+    end
+    return best, bestDist
+end
+
+-- В args ищем первый Instance-Model с Humanoid и подменяем на target.
+local function _swapTarget(args, count, target)
+    if not target then return args, count end
+    local copy = {}
+    for i = 1, count do copy[i] = args[i] end
+    for i = 1, count do
+        local v = copy[i]
+        if typeof(v) == "Instance" then
+            if v:IsA("Model") and v:FindFirstChildOfClass("Humanoid") then
+                copy[i] = target
+                return copy, count
+            end
+            if v:IsA("BasePart") then
+                local p = v.Parent
+                if p and p:IsA("Model") and p:FindFirstChildOfClass("Humanoid") then
+                    -- args ждут BasePart? Подсунем HRP цели.
+                    local newPart = target:FindFirstChild("HumanoidRootPart")
+                        or target:FindFirstChild("Torso") or target.PrimaryPart
+                    if newPart then copy[i] = newPart end
+                    return copy, count
+                end
+            end
+        end
+    end
+    return copy, count
+end
+
+-- Перед спамом стараемся "разогреть" сервер: одно настоящее Tool:Activate(),
+-- чтобы сервер открыл окно для приёма ударов. Не во всех играх работает,
+-- но не вредит.
+local function _toolActivate()
+    local char = LocalPlayer.Character
+    if not char then return end
+    local tool = char:FindFirstChildOfClass("Tool")
+    if tool then
+        pcall(function() tool:Activate() end)
+    end
+end
+
+-- ====================================================
+-- Replay: бахаем последний пойманный Remote N раз
+-- ====================================================
+local function spamLast(count, target)
+    local entry = hitJournal[1]
+    if not entry then
+        warn("[OneShotTest] журнал пуст. Сначала ударь моба сам один раз!")
+        return false, "empty journal"
+    end
+    if not entry.remote or not entry.remote.Parent then
+        warn("[OneShotTest] последний Remote больше не существует")
+        return false, "stale remote"
+    end
+
+    local args, n = _swapTarget(entry.args, entry.count, target)
+
+    print(("[OneShotTest] spam %dx: %s:%s args=%d target=%s"):format(
+        count, entry.remote:GetFullName(), entry.method, n,
+        target and target.Name or "<none>"))
+
+    _toolActivate()
+    task.wait(0.05)
+
+    local ok = 0
+    for i = 1, count do
+        local good = pcall(function()
+            if entry.method == "FireServer" or entry.method == "fireServer" then
+                entry.remote:FireServer(table.unpack(args, 1, n))
+            else
+                entry.remote:InvokeServer(table.unpack(args, 1, n))
+            end
+        end)
+        if good then ok = ok + 1 end
+        -- Маленькая пауза чтобы сервер не дропал по rate-limit
+        if i % 10 == 0 then task.wait() end
+    end
+    print(("[OneShotTest] done: %d/%d успешно"):format(ok, count))
+    return true, "ok"
+end
+
+-- ====================================================
+-- UI
+-- ====================================================
+local gui = Instance.new("ScreenGui")
+gui.Name = "OneShotTestGui"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+pcall(function() gui.Parent = game:GetService("CoreGui") end)
+if not gui.Parent then gui.Parent = LocalPlayer:WaitForChild("PlayerGui") end
+
+local frame = Instance.new("Frame", gui)
+frame.Size = UDim2.new(0, 240, 0, 280)
+frame.Position = UDim2.new(0, 20, 0.4, 0)
+frame.BackgroundColor3 = Color3.fromRGB(28, 28, 32)
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Draggable = true
+
+local corner = Instance.new("UICorner", frame)
+corner.CornerRadius = UDim.new(0, 8)
+
+local title = Instance.new("TextLabel", frame)
+title.Size = UDim2.new(1, 0, 0, 30)
+title.BackgroundColor3 = Color3.fromRGB(40, 40, 50)
+title.BorderSizePixel = 0
+title.Text = "🗡 OneShot Test"
+title.TextColor3 = Color3.fromRGB(220, 220, 230)
+title.Font = Enum.Font.GothamBold
+title.TextSize = 14
+Instance.new("UICorner", title).CornerRadius = UDim.new(0, 8)
+
+local status = Instance.new("TextLabel", frame)
+status.Size = UDim2.new(1, -10, 0, 22)
+status.Position = UDim2.new(0, 5, 0, 32)
+status.BackgroundTransparency = 1
+status.Text = "статус: ..."
+status.TextColor3 = Color3.fromRGB(180, 180, 190)
+status.Font = Enum.Font.Gotham
+status.TextSize = 11
+status.TextXAlignment = Enum.TextXAlignment.Left
+
+local function setStatus(t)
+    status.Text = t
+end
+
+local function makeButton(text, y, color, callback)
+    local b = Instance.new("TextButton", frame)
+    b.Size = UDim2.new(1, -20, 0, 30)
+    b.Position = UDim2.new(0, 10, 0, y)
+    b.BackgroundColor3 = color or Color3.fromRGB(60, 80, 130)
+    b.BorderSizePixel = 0
+    b.Text = text
+    b.TextColor3 = Color3.fromRGB(240, 240, 245)
+    b.Font = Enum.Font.GothamMedium
+    b.TextSize = 12
+    Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+    b.MouseButton1Click:Connect(function()
+        local ok, err = pcall(callback)
+        if not ok then warn("[OneShotTest] button error: " .. tostring(err)) end
+    end)
+    return b
+end
+
+-- Slider replacement: TextBox с числом
+local countBox = Instance.new("TextBox", frame)
+countBox.Size = UDim2.new(1, -20, 0, 28)
+countBox.Position = UDim2.new(0, 10, 0, 60)
+countBox.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+countBox.BorderSizePixel = 0
+countBox.Text = "100"
+countBox.PlaceholderText = "Кол-во ударов (1..1000)"
+countBox.TextColor3 = Color3.fromRGB(220, 220, 230)
+countBox.Font = Enum.Font.Gotham
+countBox.TextSize = 13
+Instance.new("UICorner", countBox).CornerRadius = UDim.new(0, 6)
+
+local function getCount()
+    local n = tonumber(countBox.Text) or 100
+    return math.clamp(math.floor(n), 1, 1000)
+end
+
+makeButton("⚙ Установить spy", 95, Color3.fromRGB(80, 100, 140), function()
+    if installSpy() then
+        setStatus("статус: spy установлен")
+    else
+        setStatus("статус: spy НЕ удался — см. F9")
+    end
+end)
+
+makeButton("📋 Показать последний хит", 130, Color3.fromRGB(70, 90, 120), function()
+    if #hitJournal == 0 then
+        setStatus("журнал пуст — ударь моба сам!")
+        warn("[OneShotTest] hitJournal пуст. Подойди к мобу и ударь ЛКМ.")
+        return
+    end
+    print("============== HIT JOURNAL ==============")
+    for i, e in ipairs(hitJournal) do
+        print(("[%d] %s:%s args=%d (%.1fs ago)"):format(
+            i, e.remote:GetFullName(), e.method, e.count, tick() - e.ts))
+        for k = 1, e.count do
+            local v = e.args[k]
+            print(("    arg%d = %s [%s]"):format(k, tostring(v), typeof(v)))
+        end
+    end
+    print("=========================================")
+    setStatus(("показано %d записей в F9"):format(#hitJournal))
+end)
+
+makeButton("💀 Убить ближайшего", 165, Color3.fromRGB(150, 60, 60), function()
+    local target, dist = findNearestMob()
+    if not target then
+        setStatus("моб не найден")
+        warn("[OneShotTest] моб не найден в workspace.NPCs")
+        return
+    end
+    setStatus(("цель: %s (%.0f ст.)"):format(target.Name, dist or 0))
+    spamLast(getCount(), target)
+end)
+
+makeButton("🔁 Replay last (без подмены)", 200, Color3.fromRGB(100, 120, 80), function()
+    spamLast(getCount(), nil)
+end)
+
+makeButton("🗑 Очистить журнал", 235, Color3.fromRGB(80, 80, 90), function()
+    table.clear(hitJournal)
+    setStatus("журнал очищен")
+end)
+
+-- Авто-инстал spy при загрузке
+task.spawn(function()
+    task.wait(0.2)
+    if installSpy() then
+        setStatus("spy готов. ударь моба ЛКМ → нажми 💀")
+    else
+        setStatus("spy НЕ установлен (executor?)")
+    end
+end)
+
+print("[OneShotTest] загружен. Окно — слева.")
 
