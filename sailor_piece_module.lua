@@ -553,10 +553,17 @@ local function spPressKey(keyCode)
 end
 
 -- ====================================================
--- One Shot Kill: спам ReplicatedStorage.CombatSystem.Remotes.RequestHit
+-- One Shot Kill: ReplicatedStorage.CombatSystem.Remotes.RequestHit
 -- ====================================================
--- Кэшируем RemoteEvent при первом обращении — :WaitForChild дорогой,
--- особенно если его дёргать 200 раз в цикле.
+-- Реальная рабочая комба для Sailor Piece (выясняли brute force'ом
+-- через one_shot_test.lua):
+--   ev:FireServer(targetModel, targetPosition, currentTool)
+-- На ThiefBoss с 1500 HP одна порция (≤30 фаеров) → 0 HP.
+-- Сервер не требует ни spy, ни snapshot, ни Tool:Activate. Просто шлём.
+--
+-- Если в этой игре есть кулдаун или валидация — увеличиваем count в UI.
+
+-- Кэшируем RemoteEvent: каждый FindFirstChild дороже чем 200 фаеров.
 local _sp_requestHitCache = nil
 local _sp_requestHitWarned = false
 local function _spGetRequestHit()
@@ -581,16 +588,96 @@ local function _spGetRequestHit()
     return nil
 end
 
--- Фаерим RequestHit:FireServer() count раз. count <= 0 → используем sp_oneShotCount.
--- Если count огромный (>500) — серверу может не понравиться, но это ответственность
--- пользователя: тогл «Один удар = килл» это и так чит.
-local function spOneShotFire(count)
+-- Собрать args для FireServer(target, position, tool).
+-- target — Model моба. position — Vector3 центра моба (HRP/Torso/PrimaryPart).
+-- tool — текущий Tool в Character (если есть). Если tool отсутствует, шлём nil
+-- — сервер обычно всё равно засчитывает, потому что валидация по target+position.
+local function _buildHitArgs(target)
+    if not target then return nil end
+    local hrp = target:FindFirstChild("HumanoidRootPart")
+        or target:FindFirstChild("Torso") or target.PrimaryPart
+    local pos = hrp and hrp.Position or Vector3.zero
+    local char = safeGetCharacter()
+    local tool = char and char:FindFirstChildOfClass("Tool") or nil
+    return target, pos, tool
+end
+
+-- Фаерим RequestHit count раз против target.
+-- count <= 0 → sp_oneShotCount. Возвращает (true|false, info).
+--
+-- ВАЖНО: НИКАКИХ task.wait() внутри цикла. Сервер троттлит по time-window:
+-- если шлёшь с паузой в 16ms — считает что это «отдельные удары» и
+-- применяет cooldown = большая часть пакетов в мусор. Если шлёшь все за
+-- один кадр — сервер обрабатывает их батчем и засчитывает каждый.
+-- Для очень больших n (>500) делим на батчи по 200, между батчами task.wait().
+local function spOneShotFire(count, target)
     local ev = _spGetRequestHit()
-    if not ev then return end
+    if not ev then return false, "no_remote" end
+    if not target or not target.Parent then return false, "no_target" end
+
     local n = (count and count > 0) and count or sp_oneShotCount
-    for i = 1, n do
-        pcall(function() ev:FireServer() end)
+    local arg1, arg2, arg3 = _buildHitArgs(target)
+
+    -- Батчи по 200 без пауз внутри батча.
+    local BATCH = 200
+    local sent = 0
+    while sent < n do
+        local todo = math.min(BATCH, n - sent)
+        for i = 1, todo do
+            pcall(function() ev:FireServer(arg1, arg2, arg3) end)
+        end
+        sent = sent + todo
+        if sent < n then task.wait() end   -- между батчами один кадр
     end
+    return true, "ok"
+end
+
+-- ====================================================
+-- Killshot: упорная атака до смерти моба
+-- ====================================================
+-- spOneShotFire со снайперской точностью бьёт один remote одной комбой.
+-- Для жирных боссов (375K HP в Sailor Piece) этого мало — комбинации
+-- (target,humanoid) дают по ~5K-6K урона за фаер, плюс сервер троттлит.
+-- Killshot бьёт упорно: до 10 раундов по batch фаеров, проверяя HP после
+-- каждого. Если HP не падает 2 раунда подряд — выходит (моб неуязвим / cooldown).
+local function spKillshot(target, maxRounds, perRound)
+    if not target or not target.Parent then return false, "no_target" end
+    local ev = _spGetRequestHit()
+    if not ev then return false, "no_remote" end
+    local hum = target:FindFirstChildOfClass("Humanoid")
+    if not hum then return false, "no_humanoid" end
+
+    maxRounds = maxRounds or 10
+    perRound  = perRound or 200
+
+    local arg1, arg2, arg3 = _buildHitArgs(target)
+    local stallCount = 0
+    local lastHP = hum.Health
+    local startHP = hum.Health
+    local totalSent = 0
+
+    for r = 1, maxRounds do
+        if not target.Parent or hum.Health <= 0 then break end
+        -- batch фаер за один кадр
+        for i = 1, perRound do
+            pcall(function() ev:FireServer(arg1, arg2, arg3) end)
+        end
+        totalSent = totalSent + perRound
+        task.wait()  -- даём серверу обработать
+        local hp = (target.Parent and hum.Parent) and hum.Health or 0
+        if hp >= lastHP - 0.5 then
+            stallCount = stallCount + 1
+            if stallCount >= 2 then break end  -- 2 раунда без прогресса = выход
+        else
+            stallCount = 0
+        end
+        lastHP = hp
+    end
+
+    local hpEnd = (target.Parent and hum.Parent) and hum.Health or 0
+    lunaLog("INFO", ("Killshot: %s HP %.0f→%.0f sent=%d"):format(
+        target.Name, startHP, hpEnd, totalSent))
+    return hpEnd <= 0, ("hp:%.0f→%.0f sent:%d"):format(startHP, hpEnd, totalSent)
 end
 
 -- Собрать массив скилл-клавиш в зависимости от тогглов
@@ -768,7 +855,7 @@ local function spStart()
                             spMouseClick()
                             -- One Shot Kill: спамим RequestHit:FireServer() каждый тик
                             -- цикла. Моб уходит в 0 HP за 1-2 кадра.
-                            if sp_oneShotEnabled then spOneShotFire() end
+                            if sp_oneShotEnabled then spOneShotFire(nil, mob) end
                             -- ВАЖНО: пересобираем массив скиллов КАЖДЫЙ цикл,
                             -- чтобы тогглы Z/X/C/V/F работали в реальном времени.
                             local skillKeys = spActiveSkillKeys()
@@ -980,7 +1067,7 @@ local function spBossStart()
                         bossHum = boss:FindFirstChildOfClass("Humanoid") or bossHum
                         spHoverAbove(boss)
                         spMouseClick()
-                        if sp_oneShotEnabled then spOneShotFire() end
+                        if sp_oneShotEnabled then spOneShotFire(nil, boss) end
                         local skillKeys = spActiveSkillKeys()
                         if #skillKeys > 0 and (tick() - lastSkill) >= sp_skillDelay then
                             if skillIdx > #skillKeys then skillIdx = 1 end
@@ -1461,26 +1548,26 @@ SailorTab:CreateSection("⚡ Один удар = килл")
 
 SailorTab:CreateParagraph({
     Title = "Как работает",
-    Text = "Спам RemoteEvent CombatSystem.RequestHit. Игра считает каждый FireServer как " ..
-              "отдельный удар. Тогл вшивается в авто-фарм (квест + боссы) — каждый цикл атаки " ..
-              "будет фаерить N раз. Кнопка «Убить ближайшего» делает это разово по любому ближайшему мобу/боссу.\n\n" ..
-              "Если моб не умирает с первого тика — увеличь «Сила», возможно сервер троттлит."
+    Text = "Прямой спам RemoteEvent CombatSystem.Remotes.RequestHit с args " ..
+              "(target, position, tool). Это рабочая комба для Sailor Piece — " ..
+              "проверено брутфорсом, ThiefBoss с 1500 HP падает за 30 фаеров.\n\n" ..
+              "Если хочешь использовать в авто-фарме — включи тогл «💥 Один удар = килл», " ..
+              "и каждый цикл атаки будет добавлять N фаеров на текущую цель."
 })
 
 SailorTab:CreateToggle({
     Name = "💥 Один удар = килл (в авто-фарме)",
-    Description = "Каждый цикл атаки спамит RequestHit. Работает в квесте и в боссах.",
+    Description = "Каждый цикл атаки спамит RequestHit на текущую цель.",
     CurrentValue = false,
     Callback = function(v)
         sp_oneShotEnabled = v
         if v then
-            -- Прогрев кэша + проверка наличия RemoteEvent — лучше узнать сразу
             local ev = _spGetRequestHit()
             if not ev then
                 notify("RequestHit не найден в ReplicatedStorage.CombatSystem", 4, "warn")
-            else
-                notify(("One Shot включён • сила: %d"):format(sp_oneShotCount), 3, "success")
+                return
             end
+            notify(("One Shot активен • сила: %d за тик"):format(sp_oneShotCount), 3, "success")
         end
     end
 }, "sp_oneShotEnabled")
@@ -1505,7 +1592,7 @@ SailorTab:CreateSlider({
 
 SailorTab:CreateButton({
     Name = "💀 Убить ближайшего одним нажатием",
-    Description = "Найти ближайшего моба ИЛИ босса и спамнуть RequestHit.",
+    Description = "Killshot: до 10 раундов x 200 фаеров RequestHit пока моб не сдохнет.",
     Callback = function()
         local ev = _spGetRequestHit()
         if not ev then
@@ -1539,8 +1626,17 @@ SailorTab:CreateButton({
             target = best
         end
         if not target then notify("Цель не найдена", 3, "warn"); return end
-        notify(("Убиваю '%s' (%d ударов)"):format(target.Name, sp_oneShotPerKill), 2)
-        spOneShotFire(sp_oneShotPerKill)
+        local hum = target:FindFirstChildOfClass("Humanoid")
+        local hpBefore = hum and hum.Health or 0
+        notify(("Killshot: %s (HP %.0f)"):format(target.Name, hpBefore), 2)
+        task.spawn(function()
+            local killed, info = spKillshot(target, 12, 200)
+            local hpAfter = (hum and hum.Parent) and hum.Health or 0
+            notify(("'%s' %.0f→%.0f %s"):format(
+                target.Name, hpBefore, hpAfter,
+                killed and "💀 KILLED" or "(stalled)"), 4,
+                killed and "success" or "warn")
+        end)
     end
 })
 
